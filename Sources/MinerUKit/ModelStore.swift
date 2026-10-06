@@ -1,0 +1,404 @@
+import Foundation
+import Darwin
+
+/// Downloads MLX-converted models from Hugging Face, ModelScope, or any
+/// HF-compatible mirror (e.g. hf-mirror.com).
+///
+/// ```swift
+/// let session = try await MinerUKit.Session.load(
+///     source: .recommended, in: appSupport.appendingPathComponent("MinerU-8bit")
+/// ) { p in print(p.fraction) }
+/// ```
+public enum ModelStore {
+
+    public enum Error: Swift.Error, LocalizedError {
+        case disallowedHost(String)
+        case listingFailed(String, Int)
+        case downloadFailed(String, Int)
+        case noModelFiles(String)
+        case sizeMismatch(String, expected: Int64, got: Int64)
+        case incomplete(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .disallowedHost(let h): return "Refusing to fetch from disallowed host: \(h)"
+            case .listingFailed(let r, let code): return "File listing failed for '\(r)' (HTTP \(code))"
+            case .downloadFailed(let f, let code): return "Download failed for '\(f)' (HTTP \(code))"
+            case .noModelFiles(let r): return "Repository '\(r)' contains no model files"
+            case .sizeMismatch(let f, let e, let g): return "'\(f)' is \(g) bytes, expected \(e)"
+            case .incomplete(let d): return "Downloaded directory is missing config.json or weights: \(d)"
+            }
+        }
+    }
+
+    // MARK: - Source
+
+    public struct Source: Sendable, Equatable {
+        public enum API: String, Sendable {
+            /// huggingface.co / hf-mirror.com layout (`/resolve/` + `/api/models/.../tree`)
+            case huggingFace
+            /// modelscope.cn layout (`/api/v1/models/.../repo`)
+            case modelScope
+        }
+
+        public var repo: String
+        public var revision: String
+        public var base: URL
+        public var api: API
+
+        public init(repo: String, revision: String, base: URL, api: API) {
+            self.repo = repo
+            self.revision = revision
+            self.base = base
+            self.api = api
+        }
+
+        public static func huggingFace(_ repo: String, revision: String = "main") -> Source {
+            Source(repo: repo, revision: revision,
+                   base: URL(string: "https://huggingface.co")!, api: .huggingFace)
+        }
+
+        /// HF-compatible CDN mirror (useful when huggingface.co is unreachable).
+        public static func hfMirror(_ repo: String, revision: String = "main") -> Source {
+            Source(repo: repo, revision: revision,
+                   base: URL(string: "https://hf-mirror.com")!, api: .huggingFace)
+        }
+
+        public static func modelScope(_ repo: String, revision: String = "master") -> Source {
+            Source(repo: repo, revision: revision,
+                   base: URL(string: "https://modelscope.cn")!, api: .modelScope)
+        }
+
+        public static func custom(_ repo: String, base: URL, api: API = .huggingFace,
+                                  revision: String = "main") -> Source {
+            Source(repo: repo, revision: revision, base: base, api: api)
+        }
+
+        // MARK: URL building
+
+        func listingURL() -> URL {
+            switch api {
+            case .huggingFace:
+                var comps = URLComponents(
+                    url: base.appendingPathComponent("api/models/\(repo)/tree/\(revision)"),
+                    resolvingAgainstBaseURL: false)!
+                comps.queryItems = [URLQueryItem(name: "recursive", value: "true")]
+                return comps.url!
+            case .modelScope:
+                var comps = URLComponents(
+                    url: base.appendingPathComponent("api/v1/models/\(repo)/repo/files"),
+                    resolvingAgainstBaseURL: false)!
+                comps.queryItems = [
+                    URLQueryItem(name: "Revision", value: revision),
+                    URLQueryItem(name: "Recursive", value: "true"),
+                ]
+                return comps.url!
+            }
+        }
+
+        func fileURL(_ path: String) -> URL {
+            switch api {
+            case .huggingFace:
+                return base.appendingPathComponent("\(repo)/resolve/\(revision)")
+                    .appendingPathComponent(path)
+            case .modelScope:
+                var comps = URLComponents(
+                    url: base.appendingPathComponent("api/v1/models/\(repo)/repo"),
+                    resolvingAgainstBaseURL: false)!
+                comps.queryItems = [
+                    URLQueryItem(name: "Revision", value: revision),
+                    URLQueryItem(name: "FilePath", value: path),
+                ]
+                return comps.url!
+            }
+        }
+    }
+
+    /// Verified-complete MLX 8bit conversion of MinerU2.5-Pro-2605-1.2B
+    /// (vision tower + tokenizer + quantization config included, Apache-2.0).
+    public static let recommended = Source.huggingFace("OpenGryd/MinerU2.5-Pro-2605-1.2B-MLX-8bit")
+
+    // MARK: - Progress
+
+    public struct Progress: Sendable, Equatable {
+        public let file: String
+        public let fileIndex: Int
+        public let fileCount: Int
+        public let fileBytes: Int64
+        public let fileTotal: Int64
+        public let totalBytes: Int64
+        public let grandTotal: Int64
+        public var fraction: Double {
+            grandTotal > 0 ? Double(totalBytes) / Double(grandTotal) : 0
+        }
+    }
+
+    struct RemoteFile {
+        let path: String
+        let size: Int64
+    }
+
+    // MARK: - Download
+
+    /// Downloads the model files of `source` into `destination` (created if
+    /// needed) and returns the directory. Files already present with the
+    /// expected size are skipped, so an interrupted download can be resumed by
+    /// calling again with the same arguments. Honors task cancellation.
+    @discardableResult
+    public static func download(
+        _ source: Source,
+        to destination: URL,
+        progress: (@Sendable (Progress) -> Void)? = nil
+    ) async throws -> URL {
+        try HostPolicy.validate(source.base)
+        let files = try await listFiles(source).filter { isModelFile($0.path) }
+        guard !files.isEmpty else { throw Error.noModelFiles(source.repo) }
+
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let grandTotal = files.reduce(Int64(0)) { $0 + $1.size }
+        var completed: Int64 = 0
+
+        for (index, file) in files.enumerated() {
+            try Task.checkCancellation()
+            let target = destination.appendingPathComponent(file.path)
+            try FileManager.default.createDirectory(
+                at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let existing = fileSize(target), existing == file.size {
+                completed += file.size
+                progress?(Progress(
+                    file: file.path, fileIndex: index + 1, fileCount: files.count,
+                    fileBytes: file.size, fileTotal: file.size,
+                    totalBytes: completed, grandTotal: grandTotal))
+                continue
+            }
+            let doneBefore = completed  // Sendable snapshot for the progress closure
+            try await downloadFile(source, file: file, to: target) { done, total in
+                progress?(Progress(
+                    file: file.path, fileIndex: index + 1, fileCount: files.count,
+                    fileBytes: done, fileTotal: total,
+                    totalBytes: doneBefore + done, grandTotal: grandTotal))
+            }
+            completed += file.size
+        }
+
+        guard
+            FileManager.default.fileExists(atPath: destination.appendingPathComponent("config.json").path),
+            files.contains(where: { $0.path.hasSuffix(".safetensors") })
+        else { throw Error.incomplete(destination.path) }
+        return destination
+    }
+
+    static func downloadFile(
+        _ source: Source,
+        file: RemoteFile,
+        to target: URL,
+        onProgress: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws {
+        let url = source.fileURL(file.path)
+        try HostPolicy.validate(url)
+        let observer = ProgressRedirectObserver(onProgress: onProgress)
+        let (tmp, response) = try await URLSession.shared.download(from: url, delegate: observer)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw Error.downloadFailed(file.path, code)
+        }
+        let got = fileSize(tmp) ?? 0
+        guard got == file.size else {
+            try? FileManager.default.removeItem(at: tmp)
+            throw Error.sizeMismatch(file.path, expected: file.size, got: got)
+        }
+        try? FileManager.default.removeItem(at: target)
+        try FileManager.default.moveItem(at: tmp, to: target)
+    }
+
+    // MARK: - Listing
+
+    struct HFTreeItem: Codable {
+        let type: String
+        let path: String
+        let size: Int64?
+    }
+
+    struct ModelScopeTree: Codable {
+        struct Data: Codable {
+            struct Entry: Codable {
+                enum CodingKeys: String, CodingKey {
+                    case type = "Type", path = "Path", size = "Size"
+                }
+                let type: String
+                let path: String
+                let size: Int64?
+            }
+            enum CodingKeys: String, CodingKey { case files = "Files" }
+            let files: [Entry]?
+        }
+        enum CodingKeys: String, CodingKey { case data = "Data" }
+        let data: Data?
+    }
+
+    static func listFiles(_ source: Source) async throws -> [RemoteFile] {
+        let url = source.listingURL()
+        try HostPolicy.validate(url)
+        let (data, response) = try await URLSession.shared.data(from: url)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw Error.listingFailed(source.repo, code)
+        }
+        switch source.api {
+        case .huggingFace:
+            let items = try JSONDecoder().decode([HFTreeItem].self, from: data)
+            return items.filter { $0.type == "file" }
+                .map { RemoteFile(path: $0.path, size: $0.size ?? 0) }
+        case .modelScope:
+            let tree = try JSONDecoder().decode(ModelScopeTree.self, from: data)
+            return (tree.data?.files ?? []).filter { $0.type == "blob" }
+                .map { RemoteFile(path: $0.path, size: $0.size ?? 0) }
+        }
+    }
+
+    // MARK: - File filter
+
+    static let modelExtensions: Set<String> = [
+        "safetensors", "json", "jinja", "txt", "model", "tiktoken",
+    ]
+
+    /// Model payload allowlist — drops READMEs, images, dotfiles, notebooks.
+    public static func isModelFile(_ path: String) -> Bool {
+        let name = (path as NSString).lastPathComponent
+        guard !name.isEmpty, !name.hasPrefix(".") else { return false }
+        let ext = (name as NSString).pathExtension.lowercased()
+        return modelExtensions.contains(ext)
+    }
+
+    static func fileSize(_ url: URL) -> Int64? {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey])
+        return values?.fileSize.map(Int64.init)
+    }
+}
+
+// MARK: - Session convenience
+
+extension MinerUKit.Session {
+    /// Downloads (or reuses an already-complete download of) the model into
+    /// `directory`, then loads it. The natural entry point for apps.
+    @discardableResult
+    public static func load(
+        source: ModelStore.Source,
+        in directory: URL,
+        progress: (@Sendable (ModelStore.Progress) -> Void)? = nil
+    ) async throws -> MinerUKit.Session {
+        let dir = try await ModelStore.download(source, to: directory, progress: progress)
+        return try await MinerUKit.Session(modelDir: dir)
+    }
+}
+
+// MARK: - Host policy (SSRF hygiene)
+
+/// Guards every outbound request: http/https only, and never to localhost,
+/// loopback, link-local, private, or reserved addresses. Applies to the
+/// initial URL and to every redirect hop.
+enum HostPolicy {
+
+    static func validate(_ url: URL) throws {
+        guard isAllowed(url) else {
+            throw ModelStore.Error.disallowedHost(url.absoluteString)
+        }
+    }
+
+    static func isAllowed(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            return false
+        }
+        guard let host = url.host(percentEncoded: false)?.lowercased(), !host.isEmpty else {
+            return false
+        }
+        if host == "localhost" || host.hasSuffix(".localhost")
+            || host.hasSuffix(".local") || host.hasSuffix(".internal") {
+            return false
+        }
+        if let v4 = ipv4Literal(host) {
+            return !isReservedIPv4(v4)
+        }
+        if host.contains(":") {  // IPv6 literal (with or without brackets)
+            let literal = host.hasPrefix("[") ? String(host.dropFirst().dropLast()) : host
+            var addr = in6_addr()
+            guard inet_pton(AF_INET6, literal, &addr) == 1 else { return false }
+            return !isReservedIPv6(addr)
+        }
+        return true
+    }
+
+    static func ipv4Literal(_ host: String) -> [Int]? {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        var octets: [Int] = []
+        for part in parts {
+            guard let v = Int(part), (0...255).contains(v) else { return nil }
+            octets.append(v)
+        }
+        return octets
+    }
+
+    /// 0/8, 10/8, 100.64/10 (CGNAT), 127/8, 169.254/16, 172.16/12, 192.0.0/24,
+    /// 192.0.2/24, 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24,
+    /// 224/4 (multicast), 240/4 + broadcast.
+    static func isReservedIPv4(_ o: [Int]) -> Bool {
+        let a = o[0], b = o[1]
+        if a == 0 || a == 10 || a == 127 { return true }
+        if a == 100 && (64...127).contains(b) { return true }
+        if a == 169 && b == 254 { return true }
+        if a == 172 && (16...31).contains(b) { return true }
+        if a == 192 && (b == 0 || b == 2 || b == 168) { return true }
+        if a == 198 && ((18...19).contains(b) || b == 51) { return true }
+        if a == 203 && b == 0 && o[2] == 113 { return true }
+        if a >= 224 { return true }
+        return false
+    }
+
+    /// ::, ::1, fc00::/7, fe80::/10, ff00::/8, and IPv4-mapped addresses.
+    static func isReservedIPv6(_ addr: in6_addr) -> Bool {
+        withUnsafeBytes(of: addr) { raw in
+            let b = Array(raw)
+            if b.allSatisfy({ $0 == 0 }) { return true }                       // ::
+            if b.prefix(15).allSatisfy({ $0 == 0 }) && b[15] == 1 { return true }  // ::1
+            if b[0] == 0xff { return true }                                     // ff00::/8
+            if (b[0] & 0xfe) == 0xfc { return true }                            // fc00::/7
+            if b[0] == 0xfe && (b[1] & 0xc0) == 0x80 { return true }            // fe80::/10
+            if b.prefix(10).allSatisfy({ $0 == 0 }) && b[10] == 0xff && b[11] == 0xff {
+                return isReservedIPv4([Int(b[12]), Int(b[13]), Int(b[14]), Int(b[15])])
+            }
+            return false
+        }
+    }
+}
+
+/// Per-call URLSession delegate: surfaces download progress and re-validates
+/// redirect targets against the host policy.
+final class ProgressRedirectObserver: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+
+    let onProgress: @Sendable (Int64, Int64) -> Void
+
+    init(onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    func urlSession(
+        _ session: URLSession, downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        onProgress(totalBytesWritten, totalBytesExpectedToWrite)
+    }
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        if let url = request.url, HostPolicy.isAllowed(url) {
+            completionHandler(request)
+        } else {
+            completionHandler(nil)  // blocks redirects to disallowed hosts
+        }
+    }
+}
