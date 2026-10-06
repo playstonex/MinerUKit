@@ -52,6 +52,9 @@ public enum MinerUKit {
         public var imageTypes: Set<String>
         /// Block types dropped as noise.
         public var skipTypes: Set<String>
+        /// Parsing tier (default `.standard`). `.flash` needs no model at all;
+        /// `.basic` only touches the model for pages without a text layer.
+        public var tier: Tier
 
         public init(
             maxPages: Int? = nil,
@@ -65,7 +68,8 @@ public enum MinerUKit {
             imageTypes: Set<String> = ["figure", "image", "chart", "image_block"],
             skipTypes: Set<String> = [
                 "abandon", "seal", "page_number", "footer", "header", "aside_text",
-            ]
+            ],
+            tier: Tier = .standard
         ) {
             self.maxPages = maxPages
             self.renderScale = renderScale
@@ -77,6 +81,7 @@ public enum MinerUKit {
             self.prompts = prompts
             self.imageTypes = imageTypes
             self.skipTypes = skipTypes
+            self.tier = tier
         }
 
         public static let standardPrompts: [String: String] = [
@@ -114,6 +119,8 @@ public enum MinerUKit {
 
     /// Converts a PDF to Markdown, loading the model for this call only.
     /// Prefer ``Session`` when converting more than one document.
+    /// With `tier == .flash` no model is needed and `modelDir` is ignored
+    /// (pass any URL).
     /// Throws `CancellationError` promptly between pages/blocks when the
     /// surrounding task is cancelled.
     public static func convert(
@@ -122,8 +129,36 @@ public enum MinerUKit {
         options: Options = .standard,
         progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> String {
+        guard options.tier.usesModel else {
+            return try flashConvert(pdfURL: pdfURL, options: options, progress: progress)
+        }
         let session = try await Session(modelDir: modelDir)
         return try await session.convert(pdfURL: pdfURL, options: options, progress: progress)
+    }
+
+    /// Flash tier: native text layer only, zero model involvement.
+    static func flashConvert(
+        pdfURL: URL,
+        options: Options,
+        progress: (@Sendable (String) -> Void)? = nil
+    ) throws -> String {
+        let report = progress ?? { _ in }
+        report(options.tier.describe)
+        let texts = TextLayer.pageTexts(of: pdfURL)
+        let pageCount = min(texts.count, options.maxPages ?? texts.count)
+        var blocks: [String] = []
+        for index in 0..<pageCount {
+            try Task.checkCancellation()
+            let raw = texts[index]
+            guard TextLayer.isTextDense(raw) else {
+                blocks.append("*（第 \(index + 1) 页无文本层，请使用 basic 及以上档位）*")
+                report("page \(index + 1): no text layer")
+                continue
+            }
+            blocks.append(TextLayer.markdownBlocks(raw))
+            report("page \(index + 1): text layer")
+        }
+        return blocks.joined(separator: "\n\n")
     }
 
     // MARK: - Reusable session
@@ -158,6 +193,12 @@ public enum MinerUKit {
             guard pageCount > 0 else { throw Error.emptyPDF }
             let report = progress ?? { _ in }
 
+            // Flash never touches the model, even on a Session.
+            guard options.tier.usesModel else {
+                return try MinerUKit.flashConvert(pdfURL: pdfURL, options: options, progress: progress)
+            }
+            report(options.tier.describe)
+
             let runID = UUID().uuidString.prefix(8)
             // Fresh ngram-ban state per generation (the factory contract),
             // shared across this conversion's generations.
@@ -167,12 +208,24 @@ public enum MinerUKit {
             let processing = UserInput.Processing(
                 resize: nil, minPixels: options.minPixels, maxPixels: options.maxPixels
             )
+            // basic extracts text-layer pages natively; advanced renders finer.
+            let pageTexts: [String]
+            if options.tier == .basic {
+                pageTexts = TextLayer.pageTexts(of: pdfURL)
+            } else {
+                pageTexts = []
+            }
 
             var pieces: [Piece] = []
             let pdfStem = pdfURL.deletingPathExtension().lastPathComponent
                 .replacingOccurrences(of: "[^A-Za-z0-9_-]", with: "_", options: .regularExpression)
             for pageIndex in 0..<pageCount {
                 try Task.checkCancellation()
+                if pageIndex < pageTexts.count, TextLayer.isTextDense(pageTexts[pageIndex]) {
+                    pieces.append(Piece(kind: .body, text: TextLayer.markdownBlocks(pageTexts[pageIndex]) + "\n\n"))
+                    report("page \(pageIndex + 1): text layer (fast path)")
+                    continue
+                }
                 guard let page = pdf.page(at: pageIndex + 1) else {
                     report("page \(pageIndex + 1): cannot open page, skipped")
                     continue
@@ -220,7 +273,10 @@ public enum MinerUKit {
             pieces: inout [Piece]
         ) async throws {
             let t0 = Date()
-            guard let rendered = renderPage(page, scale: options.renderScale),
+            // tier.renderScale keeps an explicit user override (e.g. a lower
+            // scale for speed) while letting .advanced default to 288 dpi.
+            let scale = max(options.renderScale, options.tier.renderScale)
+            guard let rendered = renderPage(page, scale: scale),
                   let layoutImage = resizedLayout(rendered, size: options.layoutSize) else {
                 report("page \(pageIndex + 1): render failed, skipped")
                 return
@@ -265,7 +321,7 @@ public enum MinerUKit {
                 let recSession = ChatSession(
                     container,
                     generateParameters: GenerateParameters(
-                        maxTokens: 1500, temperature: 0.0,
+                        maxTokens: options.tier.recognitionMaxTokens, temperature: 0.0,
                         presencePenalty: 1.0, presenceContextSize: 64
                     ),
                     components: antiLoop,

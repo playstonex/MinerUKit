@@ -19,6 +19,26 @@ Swift Package Manager：
 
 ## 使用
 
+### 四个解析档位
+
+```swift
+var options = MinerUKit.Options()
+options.tier = .flash      // 或 .basic / .standard（默认）/ .advanced
+```
+
+| 档位 | 有文本层的页 | 扫描页/图片页 | 模型 | 实测 15 页论文 |
+|---|---|---|---|---|
+| `flash` | 原生文本抽取 | 占位提示 | **不加载** | **1.2 秒** |
+| `basic` | 原生文本抽取 | 回退 VLM 两阶段 | 按需 | 1.0 秒（全有文本层时） |
+| `standard` | VLM 两阶段 | 同左 | 全页 | ~16 分钟 |
+| `advanced` | 两阶段 + 288dpi + 更大识别预算 | 同左 | 全页 | 更慢 |
+
+- 文本层抽取带段落重组（断字合并、CJK 无空格连接、列表独立成块），
+  文字零 OCR 误差；无标题层级/公式 LaTeX/表格结构（版面信息只有 VLM 档才有）
+- `flash` 档 `modelDir` 参数被忽略，`MinerUKit.convert` 直接跳过模型加载
+- `basic` 是混合模式：逐页检测文本密度（≥32 字符），够稠密走快速通道，
+  稀疏（扫描件）才落回 VLM——扫描件与文字档混合的文档性价比最高
+
 ### 下载模型（HuggingFace / ModelScope / HF 镜像）
 
 ```swift
@@ -140,7 +160,7 @@ mlx_vlm convert --hf-path hf_patched --mlx-path MinerU2.5-Pro-mlx-4bit \
 ## 测试
 
 ```bash
-swift test    # 33 个纯逻辑单测，不需要模型/Metal 设备
+swift test    # 44 个纯逻辑单测，不需要模型/Metal 设备
 ```
 
 ## 安全说明（下载）
@@ -155,8 +175,8 @@ swift test    # 33 个纯逻辑单测，不需要模型/Metal 设备
 ## 与 MinerU 官方管线的已知差异
 
 - 无跨页表格合并（官方 `cross_page_table_merge`）
-- 无原生文本层混合模式：官方 standard 档把 PDF 文本层喂给 VLM（纯文字页更快更准），
-  本包是纯视觉两阶段
+- 官方 standard 档把 PDF 文本层与 VLM 混合在区块级融合；本包的 `basic` 档是页级混合
+  （整页要么文本要么 VLM），尚未做区块级融合
 - 无超长/超宽页窗口切分（固定 1036²，A3/拼版页会挤压）
 - Markdown 表格不支持 colspan/rowspan，合并单元格以空列展开（官方转 HTML 表格）
 

@@ -93,19 +93,28 @@ struct CLI {
     // MARK: convert
 
     static func convert(_ args: [String]) async throws {
-        guard let pdf = flag("--pdf", in: args), let model = flag("--model", in: args) else {
+        guard let pdf = flag("--pdf", in: args) else {
             usage()
             exit(64)
         }
         var options = MinerUKit.Options()
         options.maxPages = flag("--pages", in: args).flatMap(Int.init)
+        if let tierName = flag("--tier", in: args) {
+            guard let tier = Tier(rawValue: tierName) else {
+                FileHandle.standardError.write("unknown tier '\(tierName)' (flash|basic|standard|advanced)\n".data(using: .utf8)!)
+                exit(64)
+            }
+            options.tier = tier
+        }
         if let out = flag("--out", in: args) {
             options.imageOutputDirectory = URL(fileURLWithPath: out)
                 .deletingLastPathComponent().appendingPathComponent("images")
         }
+        // modelDir is only consulted for model-backed tiers
+        let modelDir = URL(fileURLWithPath: flag("--model", in: args) ?? "/nonexistent")
         let markdown = try await MinerUKit.convert(
             pdfURL: URL(fileURLWithPath: pdf),
-            modelDir: URL(fileURLWithPath: model),
+            modelDir: modelDir,
             options: options
         ) { line in
             FileHandle.standardError.write((line + "\n").data(using: .utf8)!)
@@ -123,7 +132,8 @@ struct CLI {
         usage:
           minerukit download [--repo OWNER/NAME | --recommended]
                              [--mirror hf|hf-mirror|modelscope] [--to DIR] [--revision V]
-          minerukit convert --pdf FILE --model DIR [--pages N] [--out FILE]
+          minerukit convert --pdf FILE [--model DIR] [--pages N] [--out FILE]
+                             [--tier flash|basic|standard|advanced]
         """)
     }
 }
