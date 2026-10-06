@@ -143,11 +143,27 @@ mlx_vlm convert --hf-path hf_patched --mlx-path MinerU2.5-Pro-mlx-4bit \
 swift test    # 33 个纯逻辑单测，不需要模型/Metal 设备
 ```
 
+## 安全说明（下载）
+
+- 所有请求仅允许 http/https；拒绝 localhost、`.local`/`.internal`、环回/私有/链路本地/
+  保留地址（含 169.254.169.254 元数据端点）与保留 IPv6 段；**重定向每一跳重新校验**
+- LFS 文件按 HF 提供的 sha256 逐字节校验（流式，1 MiB 分块）；校验失败不重试（确定性错误）
+- 瞬时网络错误按 1s/2s/4s/8s 退避重试，共 5 次尝试；`Task` 取消随时生效
+- 已知边界：主机名校验不防 DNS 重绑定（域名解析到私网 IP 会放行）。
+  对"用户自选镜像"的场景这是接受的取舍；高安全场景应在调用方再做解析后 IP 校验
+
+## 与 MinerU 官方管线的已知差异
+
+- 无跨页表格合并（官方 `cross_page_table_merge`）
+- 无原生文本层混合模式：官方 standard 档把 PDF 文本层喂给 VLM（纯文字页更快更准），
+  本包是纯视觉两阶段
+- 无超长/超宽页窗口切分（固定 1036²，A3/拼版页会挤压）
+- Markdown 表格不支持 colspan/rowspan，合并单元格以空列展开（官方转 HTML 表格）
+
 ## 已知限制
 
 - 模型需 Apple Silicon（MLX/GPU），建议 ≥8GB 内存
 - 视觉像素预算默认对齐模型 preprocessor config（`maxPixels: 1_605_632`）；
   不要删掉这个覆盖——mlx-swift-lm 默认把预算钳制在 `1280×28×28`，会把 1036² 页面静默缩小，
   导致版面识别退化（实测踩坑）
-- 1.2B 4bit 对小字号有轻微 OCR 误差；重复循环由内置 NoRepeatNGram(100) + presence penalty 抑制
-- Markdown 表格不支持 colspan/rowspan，合并单元格以空列展开
+- 1.2B 量化模型对小字号有轻微 OCR 误差；重复循环由内置 NoRepeatNGram(100) + presence penalty 抑制

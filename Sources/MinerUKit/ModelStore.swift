@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 /// Downloads MLX-converted models from Hugging Face, ModelScope, or any
 /// HF-compatible mirror (e.g. hf-mirror.com).
@@ -10,26 +11,6 @@ import Darwin
 /// ) { p in print(p.fraction) }
 /// ```
 public enum ModelStore {
-
-    public enum Error: Swift.Error, LocalizedError {
-        case disallowedHost(String)
-        case listingFailed(String, Int)
-        case downloadFailed(String, Int)
-        case noModelFiles(String)
-        case sizeMismatch(String, expected: Int64, got: Int64)
-        case incomplete(String)
-
-        public var errorDescription: String? {
-            switch self {
-            case .disallowedHost(let h): return "Refusing to fetch from disallowed host: \(h)"
-            case .listingFailed(let r, let code): return "File listing failed for '\(r)' (HTTP \(code))"
-            case .downloadFailed(let f, let code): return "Download failed for '\(f)' (HTTP \(code))"
-            case .noModelFiles(let r): return "Repository '\(r)' contains no model files"
-            case .sizeMismatch(let f, let e, let g): return "'\(f)' is \(g) bytes, expected \(e)"
-            case .incomplete(let d): return "Downloaded directory is missing config.json or weights: \(d)"
-            }
-        }
-    }
 
     // MARK: - Source
 
@@ -136,14 +117,47 @@ public enum ModelStore {
     struct RemoteFile {
         let path: String
         let size: Int64
+        /// sha256 for LFS-backed files when the listing API provides one
+        /// (HF tree API `lfs.oid`); nil otherwise.
+        let sha256: String?
+    }
+
+    public enum Error: Swift.Error, LocalizedError {
+        case disallowedHost(String)
+        case listingFailed(String, Int)
+        case downloadFailed(String, Int)
+        case noModelFiles(String)
+        case sizeMismatch(String, expected: Int64, got: Int64)
+        case checksumMismatch(String)
+        case incomplete(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .disallowedHost(let h): return "Refusing to fetch from disallowed host: \(h)"
+            case .listingFailed(let r, let code): return "File listing failed for '\(r)' (HTTP \(code))"
+            case .downloadFailed(let f, let code): return "Download failed for '\(f)' (HTTP \(code))"
+            case .noModelFiles(let r): return "Repository '\(r)' contains no model files"
+            case .sizeMismatch(let f, let e, let g): return "'\(f)' is \(g) bytes, expected \(e)"
+            case .checksumMismatch(let f): return "'\(f)' failed sha256 verification"
+            case .incomplete(let d): return "Downloaded directory is missing config.json or weights: \(d)"
+            }
+        }
     }
 
     // MARK: - Download
 
+    /// Maximum attempts per file (1 initial + 4 retries with exponential backoff).
+    static let downloadAttempts = 5
+
     /// Downloads the model files of `source` into `destination` (created if
-    /// needed) and returns the directory. Files already present with the
-    /// expected size are skipped, so an interrupted download can be resumed by
-    /// calling again with the same arguments. Honors task cancellation.
+    /// needed) and returns the directory.
+    ///
+    /// Resumable: files already present with the expected size — and matching
+    /// sha256 when the listing API provides one — are skipped, so an
+    /// interrupted download resumes by calling again with the same arguments.
+    /// Transient network failures retry with exponential backoff (1s…8s);
+    /// checksum mismatches are deterministic and do not retry. Honors task
+    /// cancellation.
     @discardableResult
     public static func download(
         _ source: Source,
@@ -163,7 +177,7 @@ public enum ModelStore {
             let target = destination.appendingPathComponent(file.path)
             try FileManager.default.createDirectory(
                 at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if let existing = fileSize(target), existing == file.size {
+            if isCached(target, file) {
                 completed += file.size
                 progress?(Progress(
                     file: file.path, fileIndex: index + 1, fileCount: files.count,
@@ -172,11 +186,25 @@ public enum ModelStore {
                 continue
             }
             let doneBefore = completed  // Sendable snapshot for the progress closure
-            try await downloadFile(source, file: file, to: target) { done, total in
-                progress?(Progress(
-                    file: file.path, fileIndex: index + 1, fileCount: files.count,
-                    fileBytes: done, fileTotal: total,
-                    totalBytes: doneBefore + done, grandTotal: grandTotal))
+            for attempt in 1...downloadAttempts {
+                do {
+                    try await downloadFile(source, file: file, to: target) { done, total in
+                        progress?(Progress(
+                            file: file.path, fileIndex: index + 1, fileCount: files.count,
+                            fileBytes: done, fileTotal: total,
+                            totalBytes: doneBefore + done, grandTotal: grandTotal))
+                    }
+                    break
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let mismatch as Error {
+                    if case .checksumMismatch = mismatch { throw mismatch }  // deterministic
+                    guard attempt < downloadAttempts else { throw mismatch }
+                } catch {
+                    guard attempt < downloadAttempts else { throw error }
+                }
+                // exponential backoff: 1s, 2s, 4s, 8s
+                try await Task.sleep(nanoseconds: UInt64(1 << (attempt - 1)) * 1_000_000_000)
             }
             completed += file.size
         }
@@ -186,6 +214,13 @@ public enum ModelStore {
             files.contains(where: { $0.path.hasSuffix(".safetensors") })
         else { throw Error.incomplete(destination.path) }
         return destination
+    }
+
+    /// True when the on-disk file matches the expected size (and sha256 when known).
+    static func isCached(_ url: URL, _ file: RemoteFile) -> Bool {
+        guard let existing = fileSize(url), existing == file.size else { return false }
+        guard let expected = file.sha256, let actual = sha256Hex(url) else { return true }
+        return actual == expected
     }
 
     static func downloadFile(
@@ -207,16 +242,36 @@ public enum ModelStore {
             try? FileManager.default.removeItem(at: tmp)
             throw Error.sizeMismatch(file.path, expected: file.size, got: got)
         }
+        if let expected = file.sha256, file.size > 0, let actual = sha256Hex(tmp), actual != expected {
+            try? FileManager.default.removeItem(at: tmp)
+            throw Error.checksumMismatch(file.path)
+        }
         try? FileManager.default.removeItem(at: target)
         try FileManager.default.moveItem(at: tmp, to: target)
+    }
+
+    /// Incremental SHA-256, streamed in 1 MiB chunks.
+    static func sha256Hex(_ url: URL) -> String? {
+        guard let stream = InputStream(url: url) else { return nil }
+        defer { stream.close() }
+        stream.open()
+        var engine = SHA256()
+        var buffer = [UInt8](repeating: 0, count: 1 << 20)
+        while case let n = stream.read(&buffer, maxLength: buffer.count), n > 0 {
+            _ = engine.update(data: buffer[0..<n])
+        }
+        guard stream.streamStatus == .atEnd else { return nil }
+        return engine.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - Listing
 
     struct HFTreeItem: Codable {
+        struct LFS: Codable { let oid: String? }
         let type: String
         let path: String
         let size: Int64?
+        let lfs: LFS?
     }
 
     struct ModelScopeTree: Codable {
@@ -247,12 +302,15 @@ public enum ModelStore {
         switch source.api {
         case .huggingFace:
             let items = try JSONDecoder().decode([HFTreeItem].self, from: data)
-            return items.filter { $0.type == "file" }
-                .map { RemoteFile(path: $0.path, size: $0.size ?? 0) }
+            return items.filter { $0.type == "file" }.map {
+                // HF LFS oids are "sha256:<hex>"; plain (non-LFS) files have no oid
+                RemoteFile(path: $0.path, size: $0.size ?? 0,
+                           sha256: $0.lfs?.oid.flatMap { $0.hasPrefix("sha256:") ? String($0.dropFirst(7)) : $0 })
+            }
         case .modelScope:
             let tree = try JSONDecoder().decode(ModelScopeTree.self, from: data)
             return (tree.data?.files ?? []).filter { $0.type == "blob" }
-                .map { RemoteFile(path: $0.path, size: $0.size ?? 0) }
+                .map { RemoteFile(path: $0.path, size: $0.size ?? 0, sha256: nil) }
         }
     }
 
