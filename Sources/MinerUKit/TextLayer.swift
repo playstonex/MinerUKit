@@ -28,8 +28,36 @@ enum TextLayer {
     /// Reassembles line-broken page text into markdown blocks (paragraphs and
     /// list items), joined by blank lines.
     static func markdownBlocks(_ raw: String) -> String {
-        let paragraphs = reassemble(raw.components(separatedBy: .newlines))
+        let paragraphs = reassemble(raw.components(separatedBy: .newlines).map(removeGeneratedCJKSpaces))
         return paragraphs.joined(separator: "\n\n")
+    }
+
+    /// Drops the spaces PDF producers synthesize between adjacent Chinese
+    /// characters (`卫 星 技 术` -> `卫星技术`). Upstream decides this from glyph
+    /// geometry; the plain string has no geometry, so the rule is: whitespace
+    /// with a CJK character on both sides goes, whitespace next to Latin text
+    /// or digits stays (`中 文 InSAR 技术` -> `中文 InSAR 技术`).
+    static func removeGeneratedCJKSpaces(_ line: String) -> String {
+        let scalars = Array(line.unicodeScalars)
+        guard scalars.count > 2 else { return line }
+        var out = String.UnicodeScalarView()
+        var i = 0
+        while i < scalars.count {
+            let scalar = scalars[i]
+            if scalar == " " || scalar == "\u{00A0}" || scalar == "\u{3000}" {
+                var j = i
+                while j < scalars.count, scalars[j] == " " || scalars[j] == "\u{00A0}" || scalars[j] == "\u{3000}" {
+                    j += 1
+                }
+                if let before = out.last, j < scalars.count, isCJK(before), isCJK(scalars[j]) {
+                    i = j
+                    continue
+                }
+            }
+            out.append(scalar)
+            i += 1
+        }
+        return String(out)
     }
 
     // MARK: - Paragraph reassembly
@@ -96,7 +124,9 @@ enum TextLayer {
         switch scalar.value {
         case 0x4E00...0x9FFF,   // CJK Unified Ideographs
              0x3400...0x4DBF,   // Extension A
-             0x3000...0x303F,   // CJK punctuation
+             0x3040...0x30FF,   // Hiragana / Katakana
+             0xAC00...0xD7AF,   // Hangul syllables
+             0x3001...0x303F,   // CJK punctuation (excluding the ideographic space)
              0xFF00...0xFFEF:   // fullwidth forms
             return true
         default:

@@ -46,8 +46,8 @@ import MinerUKit
 
 // App 的自然入口：下载（或复用已完成的下载）后直接加载
 let session = try await MinerUKit.Session.load(
-    source: .recommended,                      // 已验证可用的 8bit 转换（1.85GB）
-    in: appSupport.appendingPathComponent("MinerU-8bit")
+    source: .recommended.with(token: hfToken), // 默认 playstonex/MinerU2.5-Pro-2605-1.2B-mlx-4bit（约 1.7GB）
+    in: appSupport.appendingPathComponent("MinerU")
 ) { p in
     progressBar.doubleValue = p.fraction       // 0…1，含文件名/序号/字节数
 }
@@ -58,6 +58,19 @@ let markdown = try await session.convert(pdfURL: url)
 
 ```swift
 let dir = try await ModelStore.download(.recommended, to: destination) { p in … }
+```
+
+**默认仓库是 gated 仓库**：需先在[模型页](https://huggingface.co/playstonex/MinerU2.5-Pro-2605-1.2B-mlx-4bit)
+登录并接受条款，再提供 HF 访问令牌（read 权限）。未授权时抛 `ModelStore.Error.authenticationRequired`。
+令牌来源：`Source.token` / CLI `--token` / 环境变量 `HF_TOKEN`、`HUGGING_FACE_HUB_TOKEN` /
+`~/.cache/huggingface/token`（仅对 huggingface.co 读取环境令牌；令牌只发往同主机的 https 请求，
+重定向到其他主机时自动去掉）。
+
+指定其他地址——`Source.parse` 接受 `owner/name`、模型页 URL（含 `/tree/<rev>`、`/resolve/<rev>/…`）、
+任意 HF 兼容主机或 modelscope.cn：
+
+```swift
+let src = try ModelStore.Source.parse("https://hf-mirror.com/OpenGryd/MinerU2.5-Pro-2605-1.2B-MLX-8bit")
 ```
 
 来源工厂：
@@ -77,11 +90,12 @@ Task 取消、SSRF 防护（仅 http/https，拒绝 localhost/环回/私有/保�
 ### 命令行
 
 ```bash
-swift run -c release minerukit download --recommended --to ~/models/mineru-8bit
-swift run -c release minerukit convert --pdf paper.pdf --model ~/models/mineru-8bit --out paper.md
-# 其他镜像：
+HF_TOKEN=hf_xxx swift run -c release minerukit download --recommended --to ~/models/mineru-4bit
+swift run -c release minerukit convert --pdf paper.pdf --model ~/models/mineru-4bit --out paper.md
+# 其他地址（owner/name 或 URL）、镜像、显式令牌：
 swift run -c release minerukit download --repo OpenGryd/MinerU2.5-Pro-2605-1.2B-MLX-8bit \
     --mirror hf-mirror --to ~/models/mineru-8bit
+swift run -c release minerukit download --repo https://hf-mirror.com/owner/name --token hf_xxx --to ~/models/x
 ```
 
 ### 一次性转换（每次调用加载模型）
@@ -153,14 +167,15 @@ mlx_vlm convert --hf-path hf_patched --mlx-path MinerU2.5-Pro-mlx-4bit \
 ## 单独使用子模块
 
 - `LayoutParser.parse(_:)` — MinerU 版面输出（`<|box_start|>…<|ref_start|>…`）解析，
-  含精确去重与 IoU 重叠抑制（≥85% 包含于 table/figure 等容器块的区块会被丢弃）
+  与 mineru-vl-utils 2.0 一致：同类型同方向 IoU>0.9 去重、≥90% 被 table/image 覆盖的区块丢弃、
+  识别 `txt_contd_tgt`（跨栏/跨页续段）
 - `TableMarkdown.convert(_:)` — MinerU 表格标记（`<fcel>/<nl>/<lcel>/<ucel>/<ecel>`）→ GFM 表格
 - `NoRepeatNGramProcessor` — 反复读 logits processor（MinerU vLLM 实现的移植）
 
 ## 测试
 
 ```bash
-swift test    # 44 个纯逻辑单测，不需要模型/Metal 设备
+swift test    # 103 个纯逻辑单测，不需要模型/Metal 设备
 ```
 
 ## 安全说明（下载）
@@ -172,11 +187,25 @@ swift test    # 44 个纯逻辑单测，不需要模型/Metal 设备
 - 已知边界：主机名校验不防 DNS 重绑定（域名解析到私网 IP 会放行）。
   对"用户自选镜像"的场景这是接受的取舍；高安全场景应在调用方再做解析后 IP 校验
 
+## 与 MinerU 官方管线的对齐情况
+
+已对齐 mineru-vl-utils 2.0.7（`mineru_client.py` / `post_process/`）：
+
+- 采样：presence 1.0 + frequency（table 0.005，其余 0.05）+ NoRepeatNGram(100)
+- 版面：IoU 去重、表内/图内覆盖过滤、`unknown→image`、`list`/`equation_block`/`image_block` 容器不直接识别
+- 区块图：不加边距；长宽比 >50 用白边补齐，短边 <28 放大；旋转方向为 PIL 逆时针（right=90、down=180、left=270）
+- 后处理：`[Non-Text]` 占位丢弃；公式修复链（`\left/\right` 配平、双下标、`\coloneqq`、`\big{)}`、`<`、花括号配平）；
+  `equation_block` 合并；正文 `\[x\]→\(x\)`、宏后补空格、下划线移出公式；`txt_contd_tgt` 续段合并
+- 公式 token 间空格清理（`LatexCleaner`）为本包额外增加，官方不做；行间公式默认用 `$$…$$`
+  （`Options.displayMath = .brackets` 可切回官方的 `\[…\]`）
+- 原生文本层：移除 CJK 字符间的生成空格
+
 ## 与 MinerU 官方管线的已知差异
 
 - 无跨页表格合并（官方 `cross_page_table_merge`）
 - 官方 standard 档把 PDF 文本层与 VLM 混合在区块级融合；本包的 `basic` 档是页级混合
   （整页要么文本要么 VLM），尚未做区块级融合
+- 无图表/图片内容分析（`image_analysis` 默认关闭，图片以裁剪图嵌入）与 `formula_number` 合并
 - 无超长/超宽页窗口切分（固定 1036²，A3/拼版页会挤压）
 - Markdown 表格不支持 colspan/rowspan，合并单元格以空列展开（官方转 HTML 表格）
 

@@ -153,3 +153,79 @@ struct ProgressTests {
         #expect(p.fraction == 0)
     }
 }
+
+@Suite("Source parsing")
+struct SourceParseTests {
+
+    @Test("default is the 4bit repository")
+    func recommended() {
+        #expect(ModelStore.recommended.repo == "playstonex/MinerU2.5-Pro-2605-1.2B-mlx-4bit")
+        #expect(ModelStore.recommended.base.host == "huggingface.co")
+    }
+
+    @Test("bare owner/name means Hugging Face")
+    func bare() throws {
+        let s = try ModelStore.Source.parse("  owner/name ")
+        #expect(s.repo == "owner/name")
+        #expect(s.base.host == "huggingface.co")
+        #expect(s.revision == "main")
+    }
+
+    @Test("model page URL, with and without revision")
+    func urls() throws {
+        let page = try ModelStore.Source.parse("https://huggingface.co/playstonex/MinerU2.5-Pro-2605-1.2B-mlx-4bit")
+        #expect(page.repo == "playstonex/MinerU2.5-Pro-2605-1.2B-mlx-4bit")
+        let tree = try ModelStore.Source.parse("https://huggingface.co/a/b/tree/v2")
+        #expect(tree.revision == "v2")
+        let file = try ModelStore.Source.parse("https://huggingface.co/a/b/resolve/dev/model.safetensors")
+        #expect(file.repo == "a/b" && file.revision == "dev")
+    }
+
+    @Test("other hosts are treated as HF-compatible, modelscope as itself")
+    func hosts() throws {
+        let mirror = try ModelStore.Source.parse("https://hf-mirror.com/a/b")
+        #expect(mirror.base.absoluteString == "https://hf-mirror.com")
+        #expect(mirror.api == .huggingFace)
+        let custom = try ModelStore.Source.parse("https://models.example.com:8443/a/b")
+        #expect(custom.base.absoluteString == "https://models.example.com:8443")
+        let ms = try ModelStore.Source.parse("https://modelscope.cn/models/OpenDataLab/y")
+        #expect(ms.api == .modelScope && ms.repo == "OpenDataLab/y" && ms.revision == "master")
+    }
+
+    @Test("garbage is rejected")
+    func invalid() {
+        for bad in ["", "   ", "justaname", "a/b/c", "a/../b", "ftp://x.com/a/b", "https://huggingface.co/onlyone", "a b/c"] {
+            #expect(throws: (any Error).self, "should reject '\(bad)'") {
+                try ModelStore.Source.parse(bad)
+            }
+        }
+    }
+
+    @Test("a private-network address parses but is refused at download time")
+    func privateHost() throws {
+        let s = try ModelStore.Source.parse("http://192.168.1.5/a/b")
+        #expect(!HostPolicy.isAllowed(s.base))
+    }
+}
+
+@Suite("Authorization")
+struct AuthTests {
+
+    @Test("token is attached only to the source host over https")
+    func scope() {
+        let s = ModelStore.Source.huggingFace("a/b", token: "hf_secret")
+        let own = s.request(for: URL(string: "https://huggingface.co/a/b/resolve/main/x")!)
+        #expect(own.value(forHTTPHeaderField: "Authorization") == "Bearer hf_secret")
+        let cdn = s.request(for: URL(string: "https://cdn-lfs.huggingface.co/x")!)
+        #expect(cdn.value(forHTTPHeaderField: "Authorization") == nil)
+        let plain = s.request(for: URL(string: "http://huggingface.co/a/b")!)
+        #expect(plain.value(forHTTPHeaderField: "Authorization") == nil)
+    }
+
+    @Test("blank tokens are ignored; mirrors never read the environment token")
+    func blank() {
+        #expect(ModelStore.Source.huggingFace("a/b").with(token: "  ").token == nil)
+        let mirror = ModelStore.Source.hfMirror("a/b")
+        #expect(mirror.effectiveToken == nil)
+    }
+}

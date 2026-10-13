@@ -31,6 +31,7 @@ struct LayoutParserTests {
         let raw = """
         <|box_start|>100 100 200 200<|box_end|><|ref_start|>text<|ref_end|>
         <|box_start|>100 100 200 200<|box_end|><|ref_start|>text<|ref_end|>
+        <|box_start|>101 100 200 200<|box_end|><|ref_start|>text<|ref_end|>
         <|box_start|>200 200 200 300<|box_end|><|ref_start|>text<|ref_end|>
         """
         #expect(LayoutParser.parse(raw).count == 1)
@@ -179,16 +180,31 @@ struct AssembleTests {
 @Suite("Display math")
 struct MathTests {
 
-    @Test("wraps bare latex in $$")
+    @Test("equation pipeline cleans spacing and wraps in $$")
     func wraps() {
-        let out = MinerUKit.Session.wrapDisplayMath("E = mc^2")
-        #expect(out == "$$\nE = mc^2\n$$")
+        let blocks = [RecognizedBlock(
+            type: "equation", box: .init(x1: 0, y1: 0, x2: 1, y2: 0.1), content: "E = mc^2"
+        )]
+        let out = PostProcess.pieces(from: blocks)
+        #expect(out.first?.text == "$$\nE=mc^2\n$$\n")
     }
 
-    @Test("keeps already-wrapped formulas")
+    @Test("delimiters already present are stripped and re-applied once")
     func passthrough() {
-        #expect(MinerUKit.Session.wrapDisplayMath("$$E = mc^2$$") == "$$E = mc^2$$")
-        #expect(MinerUKit.Session.wrapDisplayMath("\\[E = mc^2\\]") == "\\[E = mc^2\\]")
+        for raw in ["$$E = mc^2$$", "\\[E = mc^2\\]"] {
+            let blocks = [RecognizedBlock(
+                type: "equation", box: .init(x1: 0, y1: 0, x2: 1, y2: 0.1), content: raw
+            )]
+            #expect(PostProcess.pieces(from: blocks).first?.text == "$$\nE=mc^2\n$$\n")
+        }
+    }
+
+    @Test("bracket style matches the official pipeline")
+    func brackets() {
+        let blocks = [RecognizedBlock(
+            type: "equation", box: .init(x1: 0, y1: 0, x2: 1, y2: 0.1), content: "x"
+        )]
+        #expect(PostProcess.pieces(from: blocks, style: .brackets).first?.text == "\\[\nx\n\\]\n")
     }
 }
 

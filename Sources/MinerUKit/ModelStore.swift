@@ -7,9 +7,16 @@ import CryptoKit
 ///
 /// ```swift
 /// let session = try await MinerUKit.Session.load(
-///     source: .recommended, in: appSupport.appendingPathComponent("MinerU-8bit")
+///     source: .recommended, in: appSupport.appendingPathComponent("MinerU")
 /// ) { p in print(p.fraction) }
+///
+/// // Any other location: a repo id, or a full URL of a model page.
+/// let other = try ModelStore.Source.parse("https://hf-mirror.com/owner/model")
 /// ```
+///
+/// The default repository is gated on Hugging Face: file downloads need an
+/// access token of an account that has accepted the model's terms. Pass it
+/// via ``Source/token``, or set `HF_TOKEN` / log in with `huggingface-cli`.
 public enum ModelStore {
 
     // MARK: - Source
@@ -26,23 +33,55 @@ public enum ModelStore {
         public var revision: String
         public var base: URL
         public var api: API
+        /// Access token (Hugging Face `hf_…`). Only ever sent over https to
+        /// `base`, never to the CDN hosts a download redirects to.
+        public var token: String?
 
-        public init(repo: String, revision: String, base: URL, api: API) {
+        public init(repo: String, revision: String, base: URL, api: API, token: String? = nil) {
             self.repo = repo
             self.revision = revision
             self.base = base
             self.api = api
+            self.token = token
         }
 
-        public static func huggingFace(_ repo: String, revision: String = "main") -> Source {
+        /// Copy with an access token.
+        public func with(token: String?) -> Source {
+            var copy = self
+            let trimmed = token?.trimmingCharacters(in: .whitespacesAndNewlines)
+            copy.token = (trimmed?.isEmpty ?? true) ? nil : trimmed
+            return copy
+        }
+
+        /// Token to use for requests: the explicit one, else (only for
+        /// huggingface.co) the user's environment / CLI login.
+        var effectiveToken: String? {
+            if let token { return token }
+            return base.host(percentEncoded: false)?.lowercased() == "huggingface.co"
+                ? ModelStore.environmentToken() : nil
+        }
+
+        /// A request for `url` carrying the bearer token when it is safe to.
+        func request(for url: URL) -> URLRequest {
+            var request = URLRequest(url: url)
+            if let token = effectiveToken, url.scheme?.lowercased() == "https",
+               url.host(percentEncoded: false) == base.host(percentEncoded: false) {
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
+            return request
+        }
+
+        public static func huggingFace(_ repo: String, revision: String = "main",
+                                       token: String? = nil) -> Source {
             Source(repo: repo, revision: revision,
-                   base: URL(string: "https://huggingface.co")!, api: .huggingFace)
+                   base: URL(string: "https://huggingface.co")!, api: .huggingFace).with(token: token)
         }
 
         /// HF-compatible CDN mirror (useful when huggingface.co is unreachable).
-        public static func hfMirror(_ repo: String, revision: String = "main") -> Source {
+        public static func hfMirror(_ repo: String, revision: String = "main",
+                                    token: String? = nil) -> Source {
             Source(repo: repo, revision: revision,
-                   base: URL(string: "https://hf-mirror.com")!, api: .huggingFace)
+                   base: URL(string: "https://hf-mirror.com")!, api: .huggingFace).with(token: token)
         }
 
         public static func modelScope(_ repo: String, revision: String = "master") -> Source {
@@ -51,8 +90,78 @@ public enum ModelStore {
         }
 
         public static func custom(_ repo: String, base: URL, api: API = .huggingFace,
-                                  revision: String = "main") -> Source {
-            Source(repo: repo, revision: revision, base: base, api: api)
+                                  revision: String = "main", token: String? = nil) -> Source {
+            Source(repo: repo, revision: revision, base: base, api: api).with(token: token)
+        }
+
+        // MARK: Parsing
+
+        public enum ParseError: Swift.Error, LocalizedError, Equatable {
+            case empty
+            case invalid(String)
+            public var errorDescription: String? {
+                switch self {
+                case .empty: return "Model address is empty"
+                case .invalid(let s):
+                    return "Not a model address: '\(s)'. Use owner/name or a model page URL."
+                }
+            }
+        }
+
+        /// Builds a source from what a user would paste:
+        /// - `owner/name` (Hugging Face)
+        /// - `https://huggingface.co/owner/name[/tree/<revision>]`
+        /// - `https://hf-mirror.com/owner/name` (any HF-compatible host)
+        /// - `https://modelscope.cn/models/owner/name[/tree/<revision>]`
+        ///
+        /// Anything on a host other than modelscope.cn is assumed to speak
+        /// the Hugging Face API. The host is checked by ``HostPolicy`` when
+        /// downloading, not here.
+        public static func parse(_ text: String, token: String? = nil) throws -> Source {
+            let input = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !input.isEmpty else { throw ParseError.empty }
+
+            guard input.contains("://") else {
+                // Bare repo id: exactly owner/name.
+                let parts = input.split(separator: "/", omittingEmptySubsequences: false)
+                guard parts.count == 2, parts.allSatisfy(isRepoComponent) else {
+                    throw ParseError.invalid(input)
+                }
+                return .huggingFace(input, token: token)
+            }
+
+            guard let url = URL(string: input),
+                  let host = url.host(percentEncoded: false)?.lowercased(), !host.isEmpty,
+                  url.scheme?.lowercased() == "https" || url.scheme?.lowercased() == "http"
+            else { throw ParseError.invalid(input) }
+
+            var parts = url.pathComponents.filter { $0 != "/" }
+            let isModelScope = host == "modelscope.cn" || host.hasSuffix(".modelscope.cn")
+            // "models/" prefix on ModelScope pages, "models/" never on HF but harmless.
+            if parts.first == "models" { parts.removeFirst() }
+            guard parts.count >= 2, isRepoComponent(Substring(parts[0])), isRepoComponent(Substring(parts[1]))
+            else { throw ParseError.invalid(input) }
+            let repo = parts[0] + "/" + parts[1]
+
+            // .../tree/<revision> or .../resolve/<revision>/...
+            var revision: String?
+            if parts.count >= 4, ["tree", "blob", "resolve"].contains(parts[2]) {
+                revision = parts[3]
+            }
+
+            let baseString = (url.scheme ?? "https") + "://" + host + (url.port.map { ":\($0)" } ?? "")
+            let base = URL(string: baseString)!
+            if isModelScope {
+                return Source(repo: repo, revision: revision ?? "master", base: base,
+                              api: .modelScope)
+            }
+            return Source(repo: repo, revision: revision ?? "main", base: base,
+                          api: .huggingFace).with(token: token)
+        }
+
+        private static func isRepoComponent(_ part: Substring) -> Bool {
+            !part.isEmpty && part != "." && part != ".."
+                && part.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || "-_.".contains($0)) }
         }
 
         // MARK: URL building
@@ -95,9 +204,35 @@ public enum ModelStore {
         }
     }
 
-    /// Verified-complete MLX 8bit conversion of MinerU2.5-Pro-2605-1.2B
-    /// (vision tower + tokenizer + quantization config included, Apache-2.0).
-    public static let recommended = Source.huggingFace("OpenGryd/MinerU2.5-Pro-2605-1.2B-MLX-8bit")
+    /// Default model: MLX 4-bit (affine, group size 64) conversion of
+    /// MinerU2.5-Pro-2605-1.2B (~1.7 GB, Apache-2.0).
+    ///
+    /// The repository is **gated** on Hugging Face (automatic approval): accept
+    /// the terms on the model page once and supply an access token, otherwise
+    /// downloads fail with ``Error/authenticationRequired(_:)``.
+    public static let recommended = Source.huggingFace("playstonex/MinerU2.5-Pro-2605-1.2B-mlx-4bit")
+
+    /// Page where access to the default repository is requested.
+    public static let recommendedPage = URL(string: "https://huggingface.co/playstonex/MinerU2.5-Pro-2605-1.2B-mlx-4bit")!
+
+    /// Token from `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`, or the one
+    /// `huggingface-cli login` stored (`~/.cache/huggingface/token`).
+    /// Always nil inside an App Sandbox without those, in which case the app
+    /// has to ask the user for a token.
+    public static func environmentToken() -> String? {
+        let env = ProcessInfo.processInfo.environment
+        for key in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
+            if let value = env[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+        let home = env["HF_HOME"].map { URL(fileURLWithPath: $0) }
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".cache/huggingface")
+        let file = home.appendingPathComponent("token")
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
 
     // MARK: - Progress
 
@@ -130,6 +265,9 @@ public enum ModelStore {
         case sizeMismatch(String, expected: Int64, got: Int64)
         case checksumMismatch(String)
         case incomplete(String)
+        /// 401/403: gated or private repository, missing/invalid token, or
+        /// terms not accepted yet.
+        case authenticationRequired(String)
 
         public var errorDescription: String? {
             switch self {
@@ -140,6 +278,9 @@ public enum ModelStore {
             case .sizeMismatch(let f, let e, let g): return "'\(f)' is \(g) bytes, expected \(e)"
             case .checksumMismatch(let f): return "'\(f)' failed sha256 verification"
             case .incomplete(let d): return "Downloaded directory is missing config.json or weights: \(d)"
+            case .authenticationRequired(let r):
+                return "'\(r)' needs authorization. Open the model page, accept its terms, "
+                    + "then provide a Hugging Face access token (read permission)."
             }
         }
     }
@@ -198,7 +339,9 @@ public enum ModelStore {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch let mismatch as Error {
-                    if case .checksumMismatch = mismatch { throw mismatch }  // deterministic
+                    // deterministic failures: retrying cannot help
+                    if case .checksumMismatch = mismatch { throw mismatch }
+                    if case .authenticationRequired = mismatch { throw mismatch }
                     guard attempt < downloadAttempts else { throw mismatch }
                 } catch {
                     guard attempt < downloadAttempts else { throw error }
@@ -232,9 +375,11 @@ public enum ModelStore {
         let url = source.fileURL(file.path)
         try HostPolicy.validate(url)
         let observer = ProgressRedirectObserver(onProgress: onProgress)
-        let (tmp, response) = try await URLSession.shared.download(from: url, delegate: observer)
+        let (tmp, response) = try await URLSession.shared.download(
+            for: source.request(for: url), delegate: observer)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if code == 401 || code == 403 { throw Error.authenticationRequired(source.repo) }
             throw Error.downloadFailed(file.path, code)
         }
         let got = fileSize(tmp) ?? 0
@@ -294,9 +439,10 @@ public enum ModelStore {
     static func listFiles(_ source: Source) async throws -> [RemoteFile] {
         let url = source.listingURL()
         try HostPolicy.validate(url)
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await URLSession.shared.data(for: source.request(for: url))
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if code == 401 || code == 403 { throw Error.authenticationRequired(source.repo) }
             throw Error.listingFailed(source.repo, code)
         }
         switch source.api {
@@ -454,7 +600,12 @@ final class ProgressRedirectObserver: NSObject, URLSessionTaskDelegate, @uncheck
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         if let url = request.url, HostPolicy.isAllowed(url) {
-            completionHandler(request)
+            var next = request
+            // Signed CDN URLs must not receive the user's token.
+            if url.host(percentEncoded: false) != response.url?.host(percentEncoded: false) {
+                next.setValue(nil, forHTTPHeaderField: "Authorization")
+            }
+            completionHandler(next)
         } else {
             completionHandler(nil)  // blocks redirects to disallowed hosts
         }

@@ -55,6 +55,8 @@ public enum MinerUKit {
         /// Parsing tier (default `.standard`). `.flash` needs no model at all;
         /// `.basic` only touches the model for pages without a text layer.
         public var tier: Tier
+        /// Delimiters for display equations (default `$$ … $$`).
+        public var displayMath: DisplayMathStyle
 
         public init(
             maxPages: Int? = nil,
@@ -69,7 +71,8 @@ public enum MinerUKit {
             skipTypes: Set<String> = [
                 "abandon", "seal", "page_number", "footer", "header", "aside_text",
             ],
-            tier: Tier = .standard
+            tier: Tier = .standard,
+            displayMath: DisplayMathStyle = .dollars
         ) {
             self.maxPages = maxPages
             self.renderScale = renderScale
@@ -82,6 +85,7 @@ public enum MinerUKit {
             self.imageTypes = imageTypes
             self.skipTypes = skipTypes
             self.tier = tier
+            self.displayMath = displayMath
         }
 
         public static let standardPrompts: [String: String] = [
@@ -258,6 +262,10 @@ public enum MinerUKit {
             }
             var kind: Kind
             var text: String
+            /// Plain prose (`text` / `list_item`): a later `mergePrev` piece may append to it.
+            var isText = false
+            /// Continues the previous prose piece (paragraph split by a column or page break).
+            var mergePrev = false
         }
 
         static func processPage(
@@ -296,33 +304,39 @@ public enum MinerUKit {
             let blocks = LayoutParser.parse(raw, grid: LayoutParser.standardGrid)
             report("page \(pageIndex + 1): \(blocks.count) blocks (layout \(elapsed(t0))s)")
 
+            var recognized: [RecognizedBlock] = []
             for (bi, block) in blocks.enumerated() {
                 try Task.checkCancellation()
                 let t1 = Date()
                 let type = block.type
                 if options.imageTypes.contains(type) {
-                    if let crop = renderCrop(rendered, box: block.box) {
+                    if let crop = renderCrop(rendered, box: block.box, pad: 0.005) {
                         let name = try saveFigureImage(
                             crop, pageIndex: pageIndex + 1, index: bi,
                             pdfStem: pdfStem, options: options, runID: runID
                         )
-                        pieces.append(Piece(kind: .body, text: "![](\(name))\n"))
+                        recognized.append(RecognizedBlock(type: type, box: block.box, content: "", imageName: name))
                     }
                     continue
                 }
                 if options.skipTypes.contains(type) { continue }
+                // Containers are never read themselves: their children are
+                // recognized individually (equation_block is merged later).
+                if type == "equation_block" {
+                    recognized.append(RecognizedBlock(type: type, box: block.box, content: ""))
+                    continue
+                }
+                if type == "list", LayoutParser.hasChildren(block, in: blocks) { continue }
                 guard let prompt = options.prompts[type] ?? options.prompts["text"],
                       let crop = renderCrop(rendered, box: block.box) else { continue }
 
                 let oriented = block.rotation == .up ? crop : try crop.rotated(by: block.rotation.angle)
-                let url = try writePNG(oriented, name: "minerukit_\(runID)_region.png")
-                // MinerU uses presence_penalty + ngram ban on recognition passes
-                // to keep the 1.2B model out of repetition loops.
+                let url = try writePNG(prepareRegion(oriented), name: "minerukit_\(runID)_region.png")
+                defer { try? FileManager.default.removeItem(at: url) }
                 let recSession = ChatSession(
                     container,
-                    generateParameters: GenerateParameters(
-                        maxTokens: options.tier.recognitionMaxTokens, temperature: 0.0,
-                        presencePenalty: 1.0, presenceContextSize: 64
+                    generateParameters: samplingParameters(
+                        for: type, maxTokens: options.tier.recognitionMaxTokens
                     ),
                     components: antiLoop,
                     processing: processing
@@ -330,28 +344,27 @@ public enum MinerUKit {
                 let text = try await recSession.respond(to: prompt, image: .url(url))
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
-
-                switch type {
-                case "title":
-                    pieces.append(Piece(kind: .title(heightPercent: block.box.heightPercent), text: trimmed))
-                case "table":
-                    pieces.append(Piece(kind: .table, text: TableMarkdown.convert(trimmed)))
-                case "equation":
-                    pieces.append(Piece(kind: .equation, text: wrapDisplayMath(trimmed) + "\n"))
-                default:
-                    pieces.append(Piece(kind: .body, text: trimmed + "\n"))
-                }
+                recognized.append(RecognizedBlock(
+                    type: type, box: block.box, content: trimmed, mergePrev: block.mergePrev
+                ))
                 report("  \(bi + 1). \(type) \(elapsed(t1))s \(trimmed.prefix(50).replacingOccurrences(of: "\n", with: " "))")
             }
+            pieces += PostProcess.pieces(from: recognized, style: options.displayMath)
+        }
+
+        /// MinerU's per-type sampling: presence 1.0 everywhere, frequency
+        /// 0.005 for tables (long repetitive rows are legitimate) and 0.05
+        /// for everything else.
+        static func samplingParameters(for type: String, maxTokens: Int) -> GenerateParameters {
+            GenerateParameters(
+                maxTokens: maxTokens, temperature: 0.0,
+                presencePenalty: 1.0, presenceContextSize: 64,
+                frequencyPenalty: type == "table" ? 0.005 : 0.05, frequencyContextSize: 64
+            )
         }
 
         static func elapsed(_ since: Date) -> String {
             String(format: "%.1f", -since.timeIntervalSinceNow)
-        }
-
-        static func wrapDisplayMath(_ text: String) -> String {
-            if text.hasPrefix("$$") || text.hasPrefix("\\[") { return text }
-            return "$$\n\(text)\n$$"
         }
 
         /// Figures go to `options.imageOutputDirectory` when set (named after
@@ -372,15 +385,23 @@ public enum MinerUKit {
 
         /// Headings: distinct title heights map to levels 1…4 (taller → higher).
         /// Consecutive bodies starting with the same 50 chars are collapsed
-        /// (overlapping layout boxes get recognized twice).
+        /// (overlapping layout boxes get recognized twice). Prose flagged
+        /// `mergePrev` is appended to the previous prose block, even across
+        /// pages (upstream `json2md`).
         static func assemble(_ pieces: [Piece]) -> String {
             let heights = Set(
                 pieces.compactMap { if case .title(let h) = $0.kind { return h } else { return nil } }
             ).sorted(by: >)
             var lines: [String] = []
             var lastKey: String?
+            var lastTextLine: Int?
             for piece in pieces {
                 let trimmed = piece.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if piece.mergePrev, let idx = lastTextLine, !trimmed.isEmpty {
+                    lines[idx] = PostProcess.joinContinuation(lines[idx], trimmed) + "\n"
+                    lastKey = nil
+                    continue
+                }
                 if trimmed.count > 60 {
                     let key = String(trimmed.prefix(50))
                     if key == lastKey { continue }
@@ -392,11 +413,10 @@ public enum MinerUKit {
                 case .title(let h):
                     let level = heights.firstIndex(of: h).map { min($0 + 1, 4) } ?? 2
                     lines.append(String(repeating: "#", count: level) + " " + trimmed.replacingOccurrences(of: "\n", with: " "))
-                case .equation:
-                    lines.append(piece.text)
                 default:
                     lines.append(piece.text)
                 }
+                if piece.isText { lastTextLine = lines.count - 1 }
             }
             return lines.joined(separator: "\n")
         }

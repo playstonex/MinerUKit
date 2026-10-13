@@ -3,8 +3,8 @@ import MinerUKit
 
 /// minerukit — command line for the MinerUKit package.
 ///
-///   minerukit download [--repo R | --recommended] [--mirror hf|hf-mirror|modelscope]
-///                      [--to DIR] [--revision V]
+///   minerukit download [--repo R|URL | --recommended] [--mirror hf|hf-mirror|modelscope]
+///                      [--to DIR] [--revision V] [--token T]
 ///   minerukit convert --pdf FILE --model DIR [--pages N] [--out FILE]
 @main
 struct CLI {
@@ -43,21 +43,34 @@ struct CLI {
 
     static func download(_ args: [String]) async throws {
         let repo = flag("--repo", in: args)
-        let mirror = flag("--mirror", in: args) ?? "hf"
+        let mirror = flag("--mirror", in: args)
+        let token = flag("--token", in: args)
         let to = URL(fileURLWithPath: flag("--to", in: args) ?? "mineru-model")
 
-        let source: ModelStore.Source
+        var source: ModelStore.Source
         if repo == nil || args.contains("--recommended") {
-            source = ModelStore.recommended
+            source = ModelStore.recommended.with(token: token)
         } else {
-            let revision = flag("--revision", in: args) ?? (mirror == "modelscope" ? "master" : "main")
-            switch mirror {
-            case "hf": source = .huggingFace(repo!, revision: revision)
-            case "hf-mirror": source = .hfMirror(repo!, revision: revision)
-            case "modelscope": source = .modelScope(repo!, revision: revision)
-            default:
-                usage()
+            // `--repo` takes owner/name or a full model page URL.
+            do {
+                source = try ModelStore.Source.parse(repo!, token: token)
+            } catch {
+                FileHandle.standardError.write("error: \(error.localizedDescription)\n".data(using: .utf8)!)
                 exit(64)
+            }
+            if let revision = flag("--revision", in: args) { source.revision = revision }
+            // `--mirror` re-targets a bare owner/name; a full URL already names its host.
+            if let mirror, !repo!.contains("://") {
+                let revision = source.revision
+                switch mirror {
+                case "hf": break
+                case "hf-mirror": source = .hfMirror(source.repo, revision: revision, token: token)
+                case "modelscope": source = .modelScope(source.repo,
+                                                        revision: flag("--revision", in: args) ?? "master")
+                default:
+                    usage()
+                    exit(64)
+                }
             }
         }
 
@@ -130,8 +143,9 @@ struct CLI {
     static func usage() {
         print("""
         usage:
-          minerukit download [--repo OWNER/NAME | --recommended]
+          minerukit download [--repo OWNER/NAME|MODEL_URL | --recommended]
                              [--mirror hf|hf-mirror|modelscope] [--to DIR] [--revision V]
+                             [--token HF_TOKEN]      (default repo is gated; else $HF_TOKEN)
           minerukit convert --pdf FILE [--model DIR] [--pages N] [--out FILE]
                              [--tier flash|basic|standard|advanced]
         """)
