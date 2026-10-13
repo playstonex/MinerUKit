@@ -87,6 +87,52 @@ let src = try ModelStore.Source.parse("https://hf-mirror.com/OpenGryd/MinerU2.5-
 Task 取消、SSRF 防护（仅 http/https，拒绝 localhost/环回/私有/保留地址，
 **重定向跳转同样校验**）。
 
+下载进度 `Progress` 除 `fraction` 外还带速度与预估剩余时间，便于做进度条：
+
+```swift
+let dir = try await ModelStore.download(.recommended, to: destination) { p in
+    bar.doubleValue = p.fraction                       // 0…1
+    label.stringValue = p.progressDescription          // "420 MB / 1.7 GB"
+    speed.stringValue = ModelStore.Progress.formatBytes(Int64(p.bytesPerSecond)) + "/s"
+    if let eta = p.estimatedTimeRemaining { … }        // 秒；无法估计时为 nil
+}
+```
+
+### 管理已下载的模型（查看 / 校验 / 删除）
+
+下载完成后会在模型目录根部写入 `.minerukit-manifest.json`（来源 repo/revision/base
+与文件清单含大小、可用时的 sha256），后续的查看、列举、校验**全程离线**，不再联网。
+
+```swift
+// 状态：notInstalled / partial / complete（按清单逐文件核对大小；无清单时退回
+// config.json + *.safetensors 结构判断）
+switch ModelStore.installState(at: modelDir) {
+case .complete:     // 可直接加载
+case .partial:      // 下过一半，再次 download 会续传
+case .notInstalled: // 该目录不是模型
+}
+ModelStore.isInstalled(at: modelDir)        // == .complete
+
+// 占用磁盘字节（递归）；~1.7GB，适合在设置页显示“清理”
+let bytes = ModelStore.diskUsage(at: modelDir)
+
+// 列举某根目录下所有已安装模型（扫描直接子目录，带状态/占用/清单）
+for m in ModelStore.installedModels(in: modelsRoot) {
+    print(m.directory.lastPathComponent, m.state, m.diskUsage, m.manifest?.repo ?? "")
+}
+
+// 完整性校验：逐文件核对大小，清单记录了 sha256 的（HF LFS 权重）再校 sha256。
+// 需要清单；损坏时抛 sizeMismatch / checksumMismatch，可据此提示用户重下。
+try ModelStore.verify(at: modelDir)
+
+// 删除整个模型目录（不存在时为 no-op）
+try ModelStore.remove(at: modelDir)
+```
+
+`Session.load(source:in:)` 默认带**离线快路径**：目录已是 `complete` 时跳过联网列目录、
+直接从磁盘加载——首次下载成功后 App 可离线启动。需要每次都回源校验时传
+`allowOfflineReuse: false`（仍是断点续传）。
+
 ### 命令行
 
 ```bash

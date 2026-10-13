@@ -229,3 +229,235 @@ struct AuthTests {
         #expect(mirror.effectiveToken == nil)
     }
 }
+
+// MARK: - Model management
+
+/// Builds throwaway model directories under the system temp dir.
+private struct TempModel {
+    let dir: URL
+    private let fm = FileManager.default
+
+    init() throws {
+        dir = fm.temporaryDirectory.appendingPathComponent("minerukit-test-\(UUID().uuidString)")
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    func write(_ path: String, bytes: Int) throws {
+        let url = dir.appendingPathComponent(path)
+        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(repeating: 0x41, count: bytes).write(to: url)
+    }
+
+    func manifest(_ source: ModelStore.Source, _ files: [ModelStore.RemoteFile]) throws {
+        try ModelStore.Manifest(source: source, files: files).write(to: dir)
+    }
+
+    func cleanup() { try? fm.removeItem(at: dir) }
+}
+
+@Suite("Installed-model state")
+struct InstallStateTests {
+
+    @Test("missing directory is notInstalled")
+    func missing() {
+        let gone = FileManager.default.temporaryDirectory
+            .appendingPathComponent("minerukit-absent-\(UUID().uuidString)")
+        #expect(ModelStore.installState(at: gone) == .notInstalled)
+        #expect(!ModelStore.isInstalled(at: gone))
+    }
+
+    @Test("empty directory is notInstalled")
+    func empty() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        #expect(ModelStore.installState(at: m.dir) == .notInstalled)
+    }
+
+    @Test("manifest with every file present and sized is complete")
+    func completeViaManifest() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        try m.write("config.json", bytes: 10)
+        try m.write("model.safetensors", bytes: 100)
+        try m.manifest(.huggingFace("a/b"), [
+            .init(path: "config.json", size: 10, sha256: nil),
+            .init(path: "model.safetensors", size: 100, sha256: nil),
+        ])
+        #expect(ModelStore.installState(at: m.dir) == .complete)
+        #expect(ModelStore.isInstalled(at: m.dir))
+    }
+
+    @Test("manifest with a wrong-sized file is partial")
+    func partialSize() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        try m.write("config.json", bytes: 10)
+        try m.write("model.safetensors", bytes: 50)   // manifest expects 100
+        try m.manifest(.huggingFace("a/b"), [
+            .init(path: "config.json", size: 10, sha256: nil),
+            .init(path: "model.safetensors", size: 100, sha256: nil),
+        ])
+        #expect(ModelStore.installState(at: m.dir) == .partial)
+    }
+
+    @Test("manifest with a missing file is partial")
+    func partialMissing() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        try m.write("config.json", bytes: 10)
+        try m.manifest(.huggingFace("a/b"), [
+            .init(path: "config.json", size: 10, sha256: nil),
+            .init(path: "model.safetensors", size: 100, sha256: nil),
+        ])
+        #expect(ModelStore.installState(at: m.dir) == .partial)
+    }
+
+    @Test("no manifest falls back to config.json + weights structural check")
+    func structuralFallback() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        try m.write("config.json", bytes: 10)
+        #expect(ModelStore.installState(at: m.dir) == .partial)   // no weights yet
+        try m.write("model.safetensors", bytes: 100)
+        #expect(ModelStore.installState(at: m.dir) == .complete)
+    }
+}
+
+@Suite("Model manifest")
+struct ManifestTests {
+
+    @Test("round-trips source and file metadata")
+    func roundTrip() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        let src = ModelStore.Source.hfMirror("owner/name", revision: "v3")
+        try m.manifest(src, [.init(path: "config.json", size: 5, sha256: "abc")])
+        let read = try #require(ModelStore.Manifest.read(at: m.dir))
+        #expect(read.repo == "owner/name")
+        #expect(read.revision == "v3")
+        #expect(read.base == "https://hf-mirror.com")
+        #expect(read.files.first?.sha256 == "abc")
+    }
+
+    @Test("absent manifest reads as nil")
+    func absent() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        #expect(ModelStore.Manifest.read(at: m.dir) == nil)
+    }
+}
+
+@Suite("Verify, disk usage, remove, listing")
+struct ManagementTests {
+
+    @Test("verify passes on a sound install and fails on size drift")
+    func verifySize() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        try m.write("config.json", bytes: 10)
+        try m.write("model.safetensors", bytes: 100)
+        try m.manifest(.huggingFace("a/b"), [
+            .init(path: "config.json", size: 10, sha256: nil),
+            .init(path: "model.safetensors", size: 100, sha256: nil),
+        ])
+        try ModelStore.verify(at: m.dir)   // no throw
+
+        try m.write("model.safetensors", bytes: 99)
+        #expect(throws: ModelStore.Error.self) { try ModelStore.verify(at: m.dir) }
+    }
+
+    @Test("verify checks sha256 when the manifest records one")
+    func verifyChecksum() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        // "AAAA" (4 bytes of 0x41) sha256:
+        let sha = "63c1dd951ffedf6f7fd968ad4efa39b8ed584f162f46e715114ee184f8de9201"
+        try m.write("config.json", bytes: 4)
+        try m.manifest(.huggingFace("a/b"), [.init(path: "config.json", size: 4, sha256: sha)])
+        try ModelStore.verify(at: m.dir)   // matches
+
+        let bad = try TempModel(); defer { bad.cleanup() }
+        try bad.write("config.json", bytes: 4)
+        try bad.manifest(.huggingFace("a/b"), [.init(path: "config.json", size: 4, sha256: "deadbeef")])
+        #expect(throws: ModelStore.Error.self) { try ModelStore.verify(at: bad.dir) }
+    }
+
+    @Test("verify without a manifest throws manifestMissing")
+    func verifyNoManifest() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        try m.write("config.json", bytes: 10)
+        #expect(throws: ModelStore.Error.self) { try ModelStore.verify(at: m.dir) }
+    }
+
+    @Test("disk usage sums regular files recursively")
+    func disk() throws {
+        let m = try TempModel(); defer { m.cleanup() }
+        try m.write("config.json", bytes: 10)
+        try m.write("sub/weights.safetensors", bytes: 200)
+        #expect(ModelStore.diskUsage(at: m.dir) >= 210)   // >= to allow the manifest later
+    }
+
+    @Test("remove deletes the directory and is a no-op when absent")
+    func remove() throws {
+        let m = try TempModel()
+        try m.write("config.json", bytes: 1)
+        #expect(FileManager.default.fileExists(atPath: m.dir.path))
+        try ModelStore.remove(at: m.dir)
+        #expect(!FileManager.default.fileExists(atPath: m.dir.path))
+        try ModelStore.remove(at: m.dir)   // no throw on second call
+    }
+
+    @Test("installedModels finds model subdirectories and skips junk")
+    func listing() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("minerukit-root-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // A valid model (manifest + files)
+        let good = root.appendingPathComponent("model-4bit")
+        try FileManager.default.createDirectory(at: good, withIntermediateDirectories: true)
+        try Data(repeating: 0x41, count: 10).write(to: good.appendingPathComponent("config.json"))
+        try Data(repeating: 0x41, count: 20).write(to: good.appendingPathComponent("model.safetensors"))
+        try ModelStore.Manifest(source: .huggingFace("a/b"), files: [
+            .init(path: "config.json", size: 10, sha256: nil),
+            .init(path: "model.safetensors", size: 20, sha256: nil),
+        ]).write(to: good)
+
+        // Junk directory with no model payload
+        let junk = root.appendingPathComponent("notamodel")
+        try FileManager.default.createDirectory(at: junk, withIntermediateDirectories: true)
+        try Data(repeating: 0x41, count: 5).write(to: junk.appendingPathComponent("readme.txt"))
+
+        let found = ModelStore.installedModels(in: root)
+        #expect(found.count == 1)
+        #expect(found.first?.directory.lastPathComponent == "model-4bit")
+        #expect(found.first?.state == .complete)
+        #expect(found.first?.manifest?.repo == "a/b")
+    }
+}
+
+@Suite("Progress formatting")
+struct ProgressFormatTests {
+
+    @Test("ETA is nil without a rate and finite with one")
+    func eta() {
+        let noRate = ModelStore.Progress(
+            file: "x", fileIndex: 1, fileCount: 1, fileBytes: 0, fileTotal: 100,
+            totalBytes: 0, grandTotal: 100, bytesPerSecond: 0)
+        #expect(noRate.estimatedTimeRemaining == nil)
+
+        let withRate = ModelStore.Progress(
+            file: "x", fileIndex: 1, fileCount: 1, fileBytes: 50, fileTotal: 100,
+            totalBytes: 50, grandTotal: 100, bytesPerSecond: 10)
+        #expect(withRate.estimatedTimeRemaining == 5)   // 50 bytes left at 10 B/s
+    }
+
+    @Test("ETA is nil once complete")
+    func etaComplete() {
+        let done = ModelStore.Progress(
+            file: "x", fileIndex: 1, fileCount: 1, fileBytes: 100, fileTotal: 100,
+            totalBytes: 100, grandTotal: 100, bytesPerSecond: 10)
+        #expect(done.estimatedTimeRemaining == nil)
+    }
+
+    @Test("byte formatting and progress description render")
+    func bytes() {
+        #expect(!ModelStore.Progress.formatBytes(1_700_000_000).isEmpty)
+        let p = ModelStore.Progress(
+            file: "x", fileIndex: 1, fileCount: 1, fileBytes: 0, fileTotal: 0,
+            totalBytes: 500_000, grandTotal: 1_000_000)
+        #expect(p.progressDescription.contains("/"))
+    }
+}

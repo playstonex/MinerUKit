@@ -244,8 +244,49 @@ public enum ModelStore {
         public let fileTotal: Int64
         public let totalBytes: Int64
         public let grandTotal: Int64
+        /// Bytes transferred per second, averaged over the download so far.
+        /// Zero until the first non-trivial interval elapses.
+        public let bytesPerSecond: Double
         public var fraction: Double {
             grandTotal > 0 ? Double(totalBytes) / Double(grandTotal) : 0
+        }
+
+        public init(
+            file: String, fileIndex: Int, fileCount: Int,
+            fileBytes: Int64, fileTotal: Int64,
+            totalBytes: Int64, grandTotal: Int64,
+            bytesPerSecond: Double = 0
+        ) {
+            self.file = file
+            self.fileIndex = fileIndex
+            self.fileCount = fileCount
+            self.fileBytes = fileBytes
+            self.fileTotal = fileTotal
+            self.totalBytes = totalBytes
+            self.grandTotal = grandTotal
+            self.bytesPerSecond = bytesPerSecond
+        }
+
+        /// Seconds remaining at the current average rate, or nil when it
+        /// cannot be estimated yet (no measured rate, or already complete).
+        public var estimatedTimeRemaining: TimeInterval? {
+            guard bytesPerSecond > 0, grandTotal > 0 else { return nil }
+            let remaining = grandTotal - totalBytes
+            guard remaining > 0 else { return nil }
+            return Double(remaining) / bytesPerSecond
+        }
+
+        /// `"1.7 GB"`-style rendering of a byte count (SI units, matching
+        /// what download hosts advertise).
+        public static func formatBytes(_ bytes: Int64) -> String {
+            let formatter = ByteCountFormatter()
+            formatter.countStyle = .file
+            return formatter.string(fromByteCount: bytes)
+        }
+
+        /// Total vs grand total, e.g. `"420 MB / 1.7 GB"`.
+        public var progressDescription: String {
+            "\(Self.formatBytes(totalBytes)) / \(Self.formatBytes(grandTotal))"
         }
     }
 
@@ -265,6 +306,10 @@ public enum ModelStore {
         case sizeMismatch(String, expected: Int64, got: Int64)
         case checksumMismatch(String)
         case incomplete(String)
+        /// A model directory (or a file it should contain) is not on disk.
+        case modelNotFound(String)
+        /// `verify(at:)` needs a manifest, but the directory has none.
+        case manifestMissing(String)
         /// 401/403: gated or private repository, missing/invalid token, or
         /// terms not accepted yet.
         case authenticationRequired(String)
@@ -278,6 +323,8 @@ public enum ModelStore {
             case .sizeMismatch(let f, let e, let g): return "'\(f)' is \(g) bytes, expected \(e)"
             case .checksumMismatch(let f): return "'\(f)' failed sha256 verification"
             case .incomplete(let d): return "Downloaded directory is missing config.json or weights: \(d)"
+            case .modelNotFound(let d): return "No model found at: \(d)"
+            case .manifestMissing(let d): return "No MinerUKit manifest at: \(d). Re-download to enable verification."
             case .authenticationRequired(let r):
                 return "'\(r)' needs authorization. Open the model page, accept its terms, "
                     + "then provide a Hugging Face access token (read permission)."
@@ -312,6 +359,7 @@ public enum ModelStore {
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         let grandTotal = files.reduce(Int64(0)) { $0 + $1.size }
         var completed: Int64 = 0
+        let meter = RateMeter()  // measures throughput over actually-transferred bytes
 
         for (index, file) in files.enumerated() {
             try Task.checkCancellation()
@@ -323,17 +371,20 @@ public enum ModelStore {
                 progress?(Progress(
                     file: file.path, fileIndex: index + 1, fileCount: files.count,
                     fileBytes: file.size, fileTotal: file.size,
-                    totalBytes: completed, grandTotal: grandTotal))
+                    totalBytes: completed, grandTotal: grandTotal,
+                    bytesPerSecond: meter.rate()))
                 continue
             }
             let doneBefore = completed  // Sendable snapshot for the progress closure
             for attempt in 1...downloadAttempts {
                 do {
                     try await downloadFile(source, file: file, to: target) { done, total in
+                        let rate = meter.observe(fileBytes: done)
                         progress?(Progress(
                             file: file.path, fileIndex: index + 1, fileCount: files.count,
                             fileBytes: done, fileTotal: total,
-                            totalBytes: doneBefore + done, grandTotal: grandTotal))
+                            totalBytes: doneBefore + done, grandTotal: grandTotal,
+                            bytesPerSecond: rate))
                     }
                     break
                 } catch is CancellationError {
@@ -350,12 +401,15 @@ public enum ModelStore {
                 try await Task.sleep(nanoseconds: UInt64(1 << (attempt - 1)) * 1_000_000_000)
             }
             completed += file.size
+            meter.finishFile()
         }
 
         guard
             FileManager.default.fileExists(atPath: destination.appendingPathComponent("config.json").path),
             files.contains(where: { $0.path.hasSuffix(".safetensors") })
         else { throw Error.incomplete(destination.path) }
+        // Record what we installed so later launches can inspect/verify offline.
+        try? Manifest(source: source, files: files).write(to: destination)
         return destination
     }
 
@@ -478,6 +532,193 @@ public enum ModelStore {
         let values = try? url.resourceValues(forKeys: [.fileSizeKey])
         return values?.fileSize.map(Int64.init)
     }
+
+    // MARK: - Manifest (installed-model metadata)
+
+    /// Written to `.minerukit-manifest.json` at the root of a completed
+    /// download. Lets an app inspect, verify, list, and compare installed
+    /// models without going back to the network.
+    public struct Manifest: Codable, Sendable, Equatable {
+        public struct Entry: Codable, Sendable, Equatable {
+            public let path: String
+            public let size: Int64
+            public let sha256: String?
+        }
+
+        /// Repo id the files came from (e.g. `owner/name`).
+        public let repo: String
+        /// Revision/branch/tag that was resolved at download time.
+        public let revision: String
+        /// Download host (e.g. `https://huggingface.co`).
+        public let base: String
+        /// Expected files with the sizes (and sha256 when known) at download time.
+        public let files: [Entry]
+        /// When the download completed (ISO-8601, informational).
+        public let downloadedAt: String
+
+        public static let filename = ".minerukit-manifest.json"
+
+        init(source: Source, files: [RemoteFile]) {
+            self.repo = source.repo
+            self.revision = source.revision
+            self.base = source.base.absoluteString
+            self.files = files.map { Entry(path: $0.path, size: $0.size, sha256: $0.sha256) }
+            self.downloadedAt = ISO8601DateFormatter().string(from: Date())
+        }
+
+        func write(to directory: URL) throws {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(self)
+            try data.write(to: directory.appendingPathComponent(Self.filename), options: .atomic)
+        }
+
+        /// Reads the manifest at the root of `directory`, or nil when absent/unreadable.
+        public static func read(at directory: URL) -> Manifest? {
+            let url = directory.appendingPathComponent(filename)
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return try? JSONDecoder().decode(Manifest.self, from: data)
+        }
+    }
+
+    // MARK: - Installed-model management
+
+    /// Whether a directory holds a complete, partial, or absent install.
+    public enum InstallState: Sendable, Equatable {
+        /// No model directory, or it is empty.
+        case notInstalled
+        /// Some expected files are missing or the wrong size.
+        case partial
+        /// Every expected file is present with the right size.
+        case complete
+    }
+
+    /// Minimal, structural check used when no manifest is present: a model
+    /// directory needs `config.json` plus at least one `*.safetensors`.
+    static func hasModelPayload(in directory: URL) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: directory.appendingPathComponent("config.json").path) else {
+            return false
+        }
+        guard let items = try? fm.contentsOfDirectory(atPath: directory.path) else { return false }
+        return items.contains { $0.hasSuffix(".safetensors") }
+    }
+
+    /// Install state of a model directory, size-checked. Uses the download
+    /// manifest when present (authoritative file list); otherwise falls back
+    /// to a structural `config.json` + weights check. Does not hit the network.
+    public static func installState(at directory: URL) -> InstallState {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: directory.path) else { return .notInstalled }
+
+        if let manifest = Manifest.read(at: directory) {
+            guard !manifest.files.isEmpty else { return .notInstalled }
+            for entry in manifest.files {
+                let fileURL = directory.appendingPathComponent(entry.path)
+                guard let size = fileSize(fileURL), size == entry.size else { return .partial }
+            }
+            return .complete
+        }
+
+        // No manifest (older install or sideloaded dir): structural check.
+        // A model is recognized only by `config.json`; without it the
+        // directory is not a model at all (notInstalled). With it but no
+        // weights, it is a partial install.
+        let hasConfig = fm.fileExists(atPath: directory.appendingPathComponent("config.json").path)
+        guard hasConfig else { return .notInstalled }
+        return hasModelPayload(in: directory) ? .complete : .partial
+    }
+
+    /// Convenience: true only when `installState(at:) == .complete`.
+    public static func isInstalled(at directory: URL) -> Bool {
+        installState(at: directory) == .complete
+    }
+
+    /// Total bytes used by a model directory (recursive). Zero when missing.
+    public static func diskUsage(at directory: URL) -> Int64 {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: []) else { return 0 }
+        var total: Int64 = 0
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            if values?.isRegularFile == true, let size = values?.fileSize {
+                total += Int64(size)
+            }
+        }
+        return total
+    }
+
+    /// An installed model found under a root directory.
+    public struct InstalledModel: Sendable, Equatable {
+        public let directory: URL
+        public let manifest: Manifest?
+        public let state: InstallState
+        public let diskUsage: Int64
+    }
+
+    /// Scans the immediate children of `root` for model directories (those
+    /// with a manifest or a `config.json` + weights). The `root` itself is
+    /// also considered when it directly contains a model. Network-free.
+    public static func installedModels(in root: URL) -> [InstalledModel] {
+        let fm = FileManager.default
+        func describe(_ dir: URL) -> InstalledModel? {
+            let state = installState(at: dir)
+            guard state != .notInstalled else { return nil }
+            return InstalledModel(
+                directory: dir, manifest: Manifest.read(at: dir),
+                state: state, diskUsage: diskUsage(at: dir))
+        }
+
+        var results: [InstalledModel] = []
+        if let direct = describe(root) { results.append(direct) }
+
+        let children = (try? fm.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+        for child in children {
+            let isDir = (try? child.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            guard isDir else { continue }
+            if let model = describe(child) { results.append(model) }
+        }
+        return results
+    }
+
+    /// Verifies an installed model against its manifest: every file present
+    /// with the right size, and matching sha256 when the manifest recorded one
+    /// (LFS-backed weights on Hugging Face). Throws the first problem it finds.
+    /// Network-free. Requires a manifest (download writes one).
+    public static func verify(at directory: URL) throws {
+        guard FileManager.default.fileExists(atPath: directory.path) else {
+            throw Error.modelNotFound(directory.path)
+        }
+        guard let manifest = Manifest.read(at: directory) else {
+            throw Error.manifestMissing(directory.path)
+        }
+        for entry in manifest.files {
+            let fileURL = directory.appendingPathComponent(entry.path)
+            guard let size = fileSize(fileURL) else {
+                throw Error.incomplete(entry.path)
+            }
+            guard size == entry.size else {
+                throw Error.sizeMismatch(entry.path, expected: entry.size, got: size)
+            }
+            if let expected = entry.sha256, entry.size > 0 {
+                guard let actual = sha256Hex(fileURL), actual == expected else {
+                    throw Error.checksumMismatch(entry.path)
+                }
+            }
+        }
+    }
+
+    /// Deletes an installed model directory and everything under it.
+    /// No-ops when the directory does not exist.
+    public static func remove(at directory: URL) throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: directory.path) else { return }
+        try fm.removeItem(at: directory)
+    }
 }
 
 // MARK: - Session convenience
@@ -485,14 +726,62 @@ public enum ModelStore {
 extension MinerUKit.Session {
     /// Downloads (or reuses an already-complete download of) the model into
     /// `directory`, then loads it. The natural entry point for apps.
+    ///
+    /// When `directory` already holds a complete install (per
+    /// ``ModelStore/installState(at:)``), the network listing is skipped and
+    /// the model loads straight from disk — so apps launch offline after the
+    /// first successful download. Set `allowOfflineReuse` to `false` to always
+    /// re-check the remote (still resumable).
     @discardableResult
     public static func load(
         source: ModelStore.Source,
         in directory: URL,
+        allowOfflineReuse: Bool = true,
         progress: (@Sendable (ModelStore.Progress) -> Void)? = nil
     ) async throws -> MinerUKit.Session {
+        if allowOfflineReuse, ModelStore.isInstalled(at: directory) {
+            return try await MinerUKit.Session(modelDir: directory)
+        }
         let dir = try await ModelStore.download(source, to: directory, progress: progress)
         return try await MinerUKit.Session(modelDir: dir)
+    }
+}
+
+// MARK: - Download rate meter
+
+/// Thread-safe average-throughput meter shared across the download's
+/// `@Sendable` progress closures. Averages over bytes actually transferred
+/// (cached files do not count), so the rate reflects real network speed.
+final class RateMeter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let start = Date()
+    private var transferred: Int64 = 0   // completed earlier files
+    private var currentFile: Int64 = 0   // latest byte count for the in-flight file
+
+    /// Records the in-flight file's cumulative bytes and returns the current rate.
+    func observe(fileBytes: Int64) -> Double {
+        lock.lock(); defer { lock.unlock() }
+        currentFile = fileBytes
+        return rateLocked()
+    }
+
+    /// Rolls the in-flight file's bytes into the transferred total.
+    func finishFile() {
+        lock.lock(); defer { lock.unlock() }
+        transferred += currentFile
+        currentFile = 0
+    }
+
+    /// Current average rate without recording new bytes.
+    func rate() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        return rateLocked()
+    }
+
+    private func rateLocked() -> Double {
+        let elapsed = Date().timeIntervalSince(start)
+        guard elapsed > 0.25 else { return 0 }  // ignore the first noisy quarter-second
+        return Double(transferred + currentFile) / elapsed
     }
 }
 
