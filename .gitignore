@@ -3,3 +3,4 @@
 Package.resolved
 *.o
 .DS_Store
+build/
