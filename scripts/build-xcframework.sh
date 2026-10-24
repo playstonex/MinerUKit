@@ -7,14 +7,15 @@
 #             - ios-arm64    (built via `xcodebuild archive`, iOS 18.0+, device only)
 #
 # WHY A DYNAMIC XCFRAMEWORK
-#   MinerUKit statically pulls in MLX, which hard-requires macOS 14. The host
-#   app (Petal) must keep a macOS 13 deployment target, so it CANNOT link
-#   MinerUKit (or MLX) directly — SPM would refuse the platform mismatch and,
-#   even if forced, the whole app binary would then require macOS 14 at load.
-#   Instead we ship MinerUKit as a dynamic framework the app `dlopen`s only
-#   behind `#available(macOS 14,*)`. On macOS 13 the framework is never loaded,
-#   its code never enters the process, and the app does not crash. This mirrors
-#   the existing PetalASR.xcframework loader pattern.
+#   MinerUKit statically pulls in MLX (macOS 14+) and ships a metal3.2 metallib,
+#   so the package declares .macOS(.v15). The host app (Petal) must keep a
+#   macOS 13 deployment target, so it CANNOT link MinerUKit (or MLX) directly —
+#   SPM would refuse the platform mismatch and, even if forced, the whole app
+#   binary would then require macOS 15 at load. Instead we ship MinerUKit as a
+#   dynamic framework the app `dlopen`s only behind `#available(macOS 15,*)`.
+#   On macOS 13/14 the framework is never loaded, its code never enters the
+#   process, and the app does not crash. This mirrors the existing
+#   PetalASR.xcframework loader pattern.
 #
 # HOW THE APP CALLS IT
 #   MinerUKit's native API is pure-Swift async; the app reaches it through the
@@ -29,9 +30,11 @@
 #   the PetalASR build.
 #
 # TARGET
-#   macOS 14.0: the floor of the MLX dependency graph (mlx-swift 0.32 /
-#   mlx-swift-lm 3.32 both declare .macOS(.v14)). The app guards every load with
-#   #available(macOS 14,*).
+#   macOS 15.0: MinerU is a macOS 15+ feature by product decision, and 15.0 is
+#   also the floor the bundled metallib imposes (-std=metal3.2 is rejected by
+#   macOS 14's Metal runtime; metal3.1 cannot compile fence.metal). MLX itself
+#   only needs 14, but pinning 15 keeps the declared floor, the metallib floor
+#   and the app's `#available(macOS 15,*)` gate all equal to one number.
 #   iOS 18.0: experimental device-only slice. MinerUKit's sources import only
 #   CoreGraphics + PDFKit (both on iOS), and the MLX/MLXVLM graph cross-compiles
 #   for iOS. The app loads it behind #available(iOS 18,*). NOTE: the VLM may OOM
@@ -44,7 +47,7 @@ cd "$(dirname "$0")/.."
 PRODUCT="MinerUKit"
 FW_NAME="MinerUKit"
 BUILD_DIR="build/xcframework"
-MACOS_DEPLOYMENT_TARGET="14.0"
+MACOS_DEPLOYMENT_TARGET="15.0"
 IOS_DEPLOYMENT_TARGET="18.0"
 
 echo "=== Cleaning previous build ==="

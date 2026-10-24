@@ -9,8 +9,9 @@
 //  WHY THIS EXISTS
 //    MinerUKit's native API is pure-Swift `async throws` over value types and
 //    closures, which the ObjC runtime cannot call. The host app targets
-//    macOS 13 but MLX requires macOS 14, so the app must NOT link MinerUKit
-//    directly; it dlopen's this framework only behind `#available(macOS 14,*)`.
+//    macOS 13 while this package declares macOS 15, so the app must NOT link
+//    MinerUKit directly; it dlopen's this framework only behind
+//    `#available(macOS 15,*)`.
 //    This bridge converts the async API into completion-handler methods over
 //    ObjC-friendly types (NSString / NSURL / NSNumber / NSError), mirroring the
 //    PetalASR loader pattern already used in the app.
