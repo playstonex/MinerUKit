@@ -187,10 +187,28 @@ mkdir -p "$MAC_FW_DIR/Versions/A/Modules"
 cp "$DYLIB" "$MAC_FW_DIR/Versions/A/$FW_NAME"
 install_name_tool -id "@rpath/${FW_NAME}.framework/${FW_NAME}" "$MAC_FW_DIR/Versions/A/$FW_NAME"
 
-# Bundle MLX's Metal shader library next to the binary.
-echo "=== Building mlx.metallib (MLX Metal kernels, macosx) ==="
-build_metallib macosx "$MAC_FW_DIR/Versions/A/Resources/mlx.metallib"
-echo "Bundled mlx.metallib ($(du -h "$MAC_FW_DIR/Versions/A/Resources/mlx.metallib" | cut -f1))"
+# Copy EVERY SPM-generated resource bundle next to the dylib into the framework
+# Resources/ (e.g. swift-transformers_Hub.bundle — gpt2/t5 tokenizer configs).
+# MinerUKit itself declares no resources, but its dependencies do, and their
+# `Bundle.module` accessors fatalError at runtime if the bundle is not found
+# under this framework's Resources/.
+MAC_SPM_BIN="$(swift build -c release --show-bin-path)"
+for b in "$MAC_SPM_BIN"/*.bundle; do
+    [ -d "$b" ] || continue
+    /usr/bin/ditto "$b" "$MAC_FW_DIR/Versions/A/Resources/$(basename "$b")"
+    echo "Bundled dependency resource $(basename "$b") into macOS framework"
+done
+
+# MLX's Metal shader library is NO LONGER bundled inside the framework. Both
+# MinerUKit and PetalASR now share ONE copy, vendored into the app's Resources
+# and pointed at via mlx_metal_set_metallib_path at runtime (see the host app's
+# MLXSharedMetallib / loaders). We still COMPILE it here, into a sidecar dir, so
+# Scripts/pack-mlx-metallib.sh can pick it up — but it does not go into the
+# framework.
+echo "=== Building mlx.metallib (MLX Metal kernels, macosx) -> sidecar ==="
+mkdir -p "$BUILD_DIR/metallib/macos-arm64"
+build_metallib macosx "$BUILD_DIR/metallib/macos-arm64/mlx.metallib"
+echo "Compiled shared mlx.metallib ($(du -h "$BUILD_DIR/metallib/macos-arm64/mlx.metallib" | cut -f1)) (NOT bundled into framework)"
 
 # Generate Info.plist (macOS)
 cat > "$MAC_FW_DIR/Versions/A/Resources/Info.plist" << PLIST
@@ -289,11 +307,39 @@ mkdir -p "$BUILD_DIR/ios-arm64"
 cp -R "$IOS_SRC_FW" "$IOS_FW_DIR"
 install_name_tool -id "@rpath/${FW_NAME}.framework/${FW_NAME}" "$IOS_FW_DIR/$FW_NAME"
 
-# Build and bundle the iOS metallib next to the binary (flat Resources/).
-mkdir -p "$IOS_FW_DIR/Resources" "$IOS_FW_DIR/Modules"
-echo "=== Building mlx.metallib (MLX Metal kernels, iphoneos) ==="
-build_metallib iphoneos "$IOS_FW_DIR/Resources/mlx.metallib"
-echo "Bundled mlx.metallib ($(du -h "$IOS_FW_DIR/Resources/mlx.metallib" | cut -f1)) into iOS framework"
+# Flatten every SPM resource bundle (from the macOS bin-path, Contents-style)
+# into the iOS framework's flat Resources/ so dependency `Bundle.module`
+# accessors (e.g. swift-transformers_Hub) resolve on-device.
+mkdir -p "$IOS_FW_DIR/Resources"
+for b in "$MAC_SPM_BIN"/*.bundle; do
+    [ -d "$b" ] || continue
+    name="$(basename "$b")"
+    dst="$IOS_FW_DIR/Resources/$name"
+    rm -rf "$dst"; mkdir -p "$dst"
+    if [ -d "$b/Contents/Resources" ]; then
+        cp -R "$b/Contents/Resources/." "$dst/"
+    else
+        cp -R "$b/." "$dst/"
+    fi
+    cat > "$dst/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>CFBundleIdentifier</key><string>${name%.bundle}-resources</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>${name%.bundle}</string>
+	<key>CFBundlePackageType</key><string>BNDL</string>
+</dict>
+</plist>
+PLIST
+    echo "Flattened dependency resource $name into iOS framework"
+done
+echo "=== Building mlx.metallib (MLX Metal kernels, iphoneos) -> sidecar ==="
+mkdir -p "$BUILD_DIR/metallib/ios-arm64" "$IOS_FW_DIR/Modules"
+build_metallib iphoneos "$BUILD_DIR/metallib/ios-arm64/mlx.metallib"
+echo "Compiled shared mlx.metallib ($(du -h "$BUILD_DIR/metallib/ios-arm64/mlx.metallib" | cut -f1)) (NOT bundled into iOS framework)"
 
 # Add a modulemap only if xcodebuild did not already emit one.
 if [ ! -f "$IOS_FW_DIR/Modules/module.modulemap" ]; then
